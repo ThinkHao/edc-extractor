@@ -1,0 +1,47 @@
+[db_source]
+host = localhost
+port = 3306
+user = root
+password = your_password_here
+database = cloud
+table = edc_data
+connect_timeout_seconds = 10
+read_timeout_seconds = 120
+connect_retry_attempts = 3
+connect_retry_backoff_seconds = 1
+
+[db_target]
+host = localhost
+port = 3306
+user = root
+password = your_password_here
+database = nfa_dashboard
+connect_timeout_seconds = 10
+read_timeout_seconds = 120
+connect_retry_attempts = 3
+connect_retry_backoff_seconds = 1
+
+[app]
+host = 0.0.0.0
+port = 8081
+debug = false
+
+[scheduler]
+default_cron = */10 * * * *
+time_window_minutes = 60
+delay_minutes = 10
+enabled = true
+
+[sync]
+chunk_hours = 6
+edc_name_batch_size = 200
+insert_batch_size = 5000
+max_workers = 2
+max_manual_range_days = 31
+allow_large_manual_range = false
+query_timeout_seconds = 120
+max_retries = 3
+retry_backoff_seconds = 5,15,45
+
+[logging]
+level = INFO

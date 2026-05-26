@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+config.ini
+config.local.ini
+*.local.ini
+.env
+.env.*
+!.env.example
+
+# Runtime state
+edc_extractor/scheduler.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.sqlite-journal
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+build/
+dist/
+release/
+*.docker.tar.gz
+*.egg-info/
+
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts

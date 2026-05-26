@@ -1,0 +1,16 @@
+services:
+  edc-extractor:
+    image: edc-extractor:latest
+    container_name: edc-extractor
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      EDC_EXTRACTOR_CONFIG: /app/config.ini
+      EDC_SCHEDULER_DB: /app/data/scheduler.db
+    volumes:
+      - ./config.ini:/app/config.ini:ro
+      - edc-extractor-data:/app/data
+
+volumes:
+  edc-extractor-data:
