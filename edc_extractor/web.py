@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from time import sleep
 
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
 
 from .config import load_config
 from .entity_onboarding import build_entity_payload
@@ -67,32 +69,11 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
 
     @app.get("/health")
     def health():
-        source_status = _check_database("source", source, config.source.database)
-        target_status = _check_database("target", target, config.target.database)
-        recommended_source_index = False
-        source_index_error = None
-        if source_status["connected"]:
-            try:
-                recommended_source_index = source.has_recommended_index()
-            except Exception as exc:
-                source_index_error = str(exc)
-
-        status = "ok"
-        if not source_status["connected"] or not target_status["connected"] or not recommended_source_index:
-            status = "degraded"
-
-        return jsonify(
-            {
-                "status": status,
-                "recommended_source_index": recommended_source_index,
-                "source": {**source_status, "recommended_index": recommended_source_index, "index_error": source_index_error},
-                "target": target_status,
-            }
-        )
+        return jsonify(build_health_payload(source, target, config))
 
     @app.get("/api/executions")
     def executions():
-        return jsonify({"items": store.list_executions()})
+        return jsonify({"items": build_executions_payload(store)})
 
     @app.get("/api/executions/<int:execution_id>")
     def execution(execution_id: int):
@@ -103,7 +84,37 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
 
     @app.get("/api/tasks")
     def tasks():
-        return jsonify({"items": [_serialize_task(task, task_scheduler) for task in store.list_scheduled_tasks()]})
+        return jsonify({"items": build_tasks_payload(store, task_scheduler)})
+
+    @app.get("/api/events")
+    def events():
+        once = _parse_bool(request.args.get("once"), default=False)
+
+        def generate():
+            yield _sse_event("snapshot", build_snapshot_payload(store, task_scheduler, source, target, config))
+            if once:
+                return
+
+            ticks = 0
+            while True:
+                sleep(1)
+                ticks += 1
+                try:
+                    yield _sse_event("active_execution", build_active_execution_payload(store))
+                    if ticks % 5 == 0:
+                        yield _sse_event("tasks", {"items": build_tasks_payload(store, task_scheduler)})
+                        yield _sse_event("executions", {"items": build_executions_payload(store)})
+                    if ticks % 30 == 0:
+                        yield _sse_event("health", build_health_payload(source, target, config))
+                    if ticks % 15 == 0:
+                        yield _sse_event("heartbeat", {"server_time": _server_time()})
+                except Exception as exc:
+                    yield _sse_event("error", {"message": str(exc), "server_time": _server_time()})
+
+        response = Response(stream_with_context(generate()), mimetype="text/event-stream")
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["X-Accel-Buffering"] = "no"
+        return response
 
     @app.patch("/api/tasks/<int:task_id>")
     def update_task(task_id: int):
@@ -224,12 +235,75 @@ def _validate_entity_rows(rows: list[dict]) -> None:
             raise ValueError(f"items[{index}] missing required fields: {', '.join(missing)}")
 
 
+def build_snapshot_payload(
+    store: SchedulerStore,
+    task_scheduler: EDCTaskScheduler,
+    source,
+    target,
+    config,
+) -> dict:
+    return {
+        "tasks": build_tasks_payload(store, task_scheduler),
+        "executions": build_executions_payload(store),
+        "active_execution": build_active_execution_payload(store),
+        "health": build_health_payload(source, target, config),
+        "server_time": _server_time(),
+    }
+
+
+def build_tasks_payload(store: SchedulerStore, task_scheduler: EDCTaskScheduler) -> list[dict]:
+    return [_serialize_task(task, task_scheduler) for task in store.list_scheduled_tasks()]
+
+
+def build_executions_payload(store: SchedulerStore) -> list[dict]:
+    return store.list_executions()
+
+
+def build_active_execution_payload(store: SchedulerStore) -> dict | None:
+    for item in store.list_executions():
+        if item.get("status") == "running":
+            return item
+    return None
+
+
+def build_health_payload(source, target, config) -> dict:
+    source_status = _check_database("source", source, config.source.database)
+    target_status = _check_database("target", target, config.target.database)
+    recommended_source_index = False
+    source_index_error = None
+    if source_status["connected"]:
+        try:
+            recommended_source_index = source.has_recommended_index()
+        except Exception as exc:
+            source_index_error = str(exc)
+
+    status = "ok"
+    if not source_status["connected"] or not target_status["connected"] or not recommended_source_index:
+        status = "degraded"
+
+    return {
+        "status": status,
+        "recommended_source_index": recommended_source_index,
+        "source": {**source_status, "recommended_index": recommended_source_index, "index_error": source_index_error},
+        "target": target_status,
+    }
+
+
 def _check_database(role: str, adapter, database: str) -> dict:
     try:
         adapter.ping()
         return {"role": role, "connected": True, "database": database, "error": None}
     except Exception as exc:
         return {"role": role, "connected": False, "database": database, "error": str(exc)}
+
+
+def _sse_event(event: str, payload: dict | None) -> str:
+    data = json.dumps(payload, ensure_ascii=False, default=str)
+    return f"event: {event}\ndata: {data}\n\n"
+
+
+def _server_time() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def _serialize_task(task: dict | None, task_scheduler: EDCTaskScheduler) -> dict:

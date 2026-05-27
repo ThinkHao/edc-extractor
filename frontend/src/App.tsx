@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   CalendarDays,
@@ -24,7 +24,6 @@ import {
   Execution,
   ExecutionProgress,
   getTasks,
-  getExecution,
   getExecutions,
   getHealth,
   Health,
@@ -41,6 +40,14 @@ import {
 type Notice = { tone: "ok" | "error" | "info"; text: string } | null;
 type ViewKey = "状态" | "EDC发现" | "映射录入" | "同步任务" | "执行记录";
 type RangeSelectMode = "start" | "end";
+type SseState = "connecting" | "connected" | "fallback";
+
+type SseSnapshot = {
+  tasks?: ScheduledTask[];
+  executions?: Execution[];
+  active_execution?: Execution | null;
+  health?: Health;
+};
 
 const navItems: Array<{ label: ViewKey; icon: typeof Activity }> = [
   { label: "状态", icon: Activity },
@@ -191,6 +198,8 @@ export function App() {
   const [taskState, setTaskState] = useState<ScheduledTask | null>(null);
   const [taskDraft, setTaskDraft] = useState<ScheduledTask | null>(null);
   const [taskDirty, setTaskDirty] = useState(false);
+  const [sseState, setSseState] = useState<SseState>("connecting");
+  const trackedExecutionIdRef = useRef<number | null>(null);
 
   const loadHealth = useCallback(async () => {
     setLoading((current) => ({ ...current, health: true }));
@@ -227,6 +236,55 @@ export function App() {
     await Promise.all([loadHealth(), loadExecutions(), loadTasks()]);
   }, [loadExecutions, loadHealth, loadTasks]);
 
+  const applyTasks = useCallback((items: ScheduledTask[]) => {
+    const nextTask = items[0] || null;
+    setTaskState(nextTask);
+    setTaskDraft((current) => (taskDirty ? current : nextTask));
+  }, [taskDirty]);
+
+  const applyExecutions = useCallback((items: Execution[]) => {
+    setExecutions(items);
+    const trackedId = trackedExecutionIdRef.current;
+    if (!trackedId) return;
+    const tracked = items.find((item) => item.id === trackedId);
+    if (!tracked || tracked.status === "running") return;
+    setLastSync({
+      execution_id: tracked.id,
+      rows_read: tracked.rows_read,
+      rows_written: tracked.rows_written,
+      unmapped_count: tracked.unmapped_count,
+      duration_ms: tracked.duration_ms
+    });
+    setActiveExecutionId(null);
+    setActiveExecution(null);
+    setLoading((current) => ({ ...current, sync: false }));
+    if (tracked.status === "failed") {
+      setNotice({ tone: "error", text: tracked.error_message || `同步任务 ${tracked.id} 失败` });
+    }
+  }, []);
+
+  const applySnapshot = useCallback((payload: SseSnapshot) => {
+    if (payload.health) {
+      setHealth(payload.health);
+    }
+    if (payload.tasks) {
+      applyTasks(payload.tasks);
+    }
+    if (payload.executions) {
+      applyExecutions(payload.executions);
+    }
+    if ("active_execution" in payload) {
+      setActiveExecution(payload.active_execution || null);
+      if (payload.active_execution) {
+        setActiveExecutionId(payload.active_execution.id);
+        setLoading((current) => ({ ...current, sync: true }));
+      } else {
+        setActiveExecutionId(null);
+        setLoading((current) => ({ ...current, sync: false }));
+      }
+    }
+  }, [applyExecutions, applyTasks]);
+
   const loadEntities = useCallback(async () => {
     setLoading((current) => ({ ...current, entities: true }));
     try {
@@ -250,77 +308,92 @@ export function App() {
   }, [limit, onlyUnconfigured, range.end, range.start]);
 
   useEffect(() => {
+    trackedExecutionIdRef.current = activeExecutionId || lastSync?.execution_id || null;
+  }, [activeExecutionId, lastSync?.execution_id]);
+
+  useEffect(() => {
     void refreshOperationalState();
   }, [refreshOperationalState]);
 
   useEffect(() => {
+    if (sseState === "connected") return;
     const refresh = () => {
       if (document.visibilityState === "hidden") return;
       void Promise.all([loadExecutions(), loadTasks()]);
     };
-    const timer = window.setInterval(refresh, 5000);
+    const timer = window.setInterval(refresh, 15000);
     return () => window.clearInterval(timer);
-  }, [loadExecutions, loadTasks]);
+  }, [loadExecutions, loadTasks, sseState]);
 
   useEffect(() => {
+    if (sseState === "connected") return;
     const refresh = () => {
       if (document.visibilityState === "hidden") return;
       void loadHealth();
     };
     const timer = window.setInterval(refresh, 30000);
     return () => window.clearInterval(timer);
-  }, [loadHealth]);
+  }, [loadHealth, sseState]);
 
   useEffect(() => {
-    if (!activeExecutionId) return;
-    let cancelled = false;
-    const poll = async () => {
-      try {
-        const execution = await getExecution(activeExecutionId);
-        if (cancelled) return;
-        setActiveExecution(execution);
-        if (execution.status === "completed") {
-          setLoading((current) => ({ ...current, sync: false }));
-          setNotice({ tone: "ok", text: `同步任务 ${execution.id} 已完成` });
-          setLastSync({
-            execution_id: execution.id,
-            rows_read: execution.rows_read,
-            rows_written: execution.rows_written,
-            unmapped_count: execution.unmapped_count,
-            duration_ms: execution.duration_ms
-          });
-          setActiveExecutionId(null);
-          await Promise.all([loadExecutions(), loadTasks()]);
+    let source: EventSource | null = null;
+    let reconnectTimer = 0;
+    let closed = false;
+
+    const connect = () => {
+      if (closed || document.visibilityState === "hidden") return;
+      setSseState((current) => (current === "connected" ? current : "connecting"));
+      source = new EventSource("/api/events");
+      source.onopen = () => setSseState("connected");
+      source.onerror = () => {
+        setSseState("fallback");
+        source?.close();
+        if (!closed) {
+          window.clearTimeout(reconnectTimer);
+          reconnectTimer = window.setTimeout(connect, 5000);
         }
-        if (execution.status === "failed") {
-          setLoading((current) => ({ ...current, sync: false }));
-          setNotice({ tone: "error", text: execution.error_message || `同步任务 ${execution.id} 失败` });
-          setActiveExecutionId(null);
-          await Promise.all([loadExecutions(), loadTasks()]);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setNotice({ tone: "error", text: error instanceof Error ? error.message : "同步进度加载失败" });
-        }
+      };
+      source.addEventListener("snapshot", (event) => applySnapshot(parseEventData(event)));
+      source.addEventListener("tasks", (event) => applyTasks(parseEventData<{ items: ScheduledTask[] }>(event).items || []));
+      source.addEventListener("executions", (event) => applyExecutions(parseEventData<{ items: Execution[] }>(event).items || []));
+      source.addEventListener("active_execution", (event) => applySnapshot({ active_execution: parseEventData<Execution | null>(event) }));
+      source.addEventListener("health", (event) => setHealth(parseEventData<Health>(event)));
+      source.addEventListener("error", (event) => {
+        const payload = parseEventData<{ message?: string }>(event);
+        setNotice({ tone: "error", text: payload.message || "实时状态刷新失败" });
+      });
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        source?.close();
+        source = null;
+        setSseState("fallback");
+        return;
       }
+      connect();
+      void refreshOperationalState();
     };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 1000);
+
+    connect();
+    document.addEventListener("visibilitychange", handleVisibility);
     return () => {
-      cancelled = true;
-      window.clearInterval(timer);
+      closed = true;
+      window.clearTimeout(reconnectTimer);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      source?.close();
     };
-  }, [activeExecutionId, loadExecutions, loadTasks]);
+  }, [applySnapshot, applyTasks, refreshOperationalState]);
 
   useEffect(() => {
-    if (activeExecutionId) return;
+    if (activeExecutionId || sseState === "connected") return;
     const running = executions.find((item) => item.status === "running");
     if (running) {
       setActiveExecution(running);
       return;
     }
     setActiveExecution((current) => (current?.status === "running" ? null : current));
-  }, [activeExecutionId, executions]);
+  }, [activeExecutionId, executions, sseState]);
 
   const configuredCount = entities.filter((item) => item.configured).length;
   const backupCount = entities.filter((item) => item.is_backup).length;
@@ -551,6 +624,7 @@ export function App() {
               {loading.health ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
               刷新
             </button>
+            <StatusPill label="实时" value={sseState === "connected" ? "SSE" : "兜底"} ok={sseState === "connected"} />
           </div>
         </header>
 
@@ -980,6 +1054,11 @@ function parseProgress(value: string | null): ExecutionProgress {
   } catch {
     return {};
   }
+}
+
+function parseEventData<T>(event: Event): T {
+  const message = event as MessageEvent<string>;
+  return message.data ? JSON.parse(message.data) as T : ({} as T);
 }
 
 function StatusPill({ label, value, ok, title }: { label: string; value: string; ok: boolean; title?: string }) {
