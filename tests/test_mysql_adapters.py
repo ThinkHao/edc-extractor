@@ -3,6 +3,31 @@ from edc_extractor.config import DBConfig
 from edc_extractor.mysql_adapters import MySQLEDCTarget, _load_enabled_entities
 
 
+def test_connect_uses_mysql_connector_supported_timeout_args(monkeypatch):
+    captured_kwargs = {}
+
+    def fake_connect(**kwargs):
+        captured_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(mysql_adapters.mysql.connector, "connect", fake_connect)
+
+    mysql_adapters.connect(
+        DBConfig(
+            host="localhost",
+            port=3306,
+            user="root",
+            password="",
+            database="nfa",
+            read_timeout_seconds=120,
+        )
+    )
+
+    assert captured_kwargs["connection_timeout"] == 10
+    assert "read_timeout" not in captured_kwargs
+    assert "write_timeout" not in captured_kwargs
+
+
 def test_load_enabled_entities_reads_explicit_backup_flag():
     conn = FakeSelectConnection(
         [
@@ -57,6 +82,37 @@ def test_upsert_entities_writes_explicit_backup_flag(monkeypatch):
     assert payload[0][5] == 1
 
 
+def test_load_entity_keys_ensures_schema_before_read(monkeypatch):
+    conn = FakeWriteConnection()
+    calls = []
+
+    def fake_ensure_schema(schema_conn):
+        calls.append(schema_conn)
+
+    monkeypatch.setattr(mysql_adapters, "connect", lambda config: conn)
+    monkeypatch.setattr(mysql_adapters, "_ensure_entity_schema", fake_ensure_schema)
+    target = MySQLEDCTarget(
+        DBConfig(
+            host="localhost",
+            port=3306,
+            user="root",
+            password="",
+            database="nfa",
+        )
+    )
+
+    assert target.load_entity_keys() == set()
+    assert calls == [conn]
+
+
+def test_ensure_entity_schema_creates_mapping_table():
+    conn = FakeSchemaConnection(column_count=1, index_count=1)
+
+    mysql_adapters._ensure_entity_schema(conn)
+
+    assert any("CREATE TABLE IF NOT EXISTS edc_entities" in query for query in conn.cursor_obj.executed_queries)
+
+
 class FakeSelectConnection:
     def __init__(self, rows):
         self.rows = rows
@@ -91,6 +147,9 @@ class FakeWriteCursor:
         self.executemany_query = query
         self.executemany_payload = payload
 
+    def __iter__(self):
+        return iter([])
+
 
 class FakeWriteConnection:
     def __init__(self):
@@ -107,4 +166,27 @@ class FakeWriteConnection:
         return None
 
     def close(self):
+        return None
+
+
+class FakeSchemaCursor:
+    def __init__(self, column_count, index_count):
+        self.results = [(column_count,), (index_count,)]
+        self.executed_queries = []
+
+    def execute(self, query, params=None):
+        self.executed_queries.append(query)
+
+    def fetchone(self):
+        return self.results.pop(0)
+
+
+class FakeSchemaConnection:
+    def __init__(self, column_count, index_count):
+        self.cursor_obj = FakeSchemaCursor(column_count, index_count)
+
+    def cursor(self, dictionary=False):
+        return self.cursor_obj
+
+    def commit(self):
         return None

@@ -23,8 +23,6 @@ def connect(config: DBConfig):
                 password=config.password,
                 database=config.database,
                 connection_timeout=config.connect_timeout_seconds,
-                read_timeout=config.read_timeout_seconds,
-                write_timeout=config.read_timeout_seconds,
                 autocommit=False,
             )
         except Exception as exc:
@@ -200,6 +198,7 @@ class MySQLEDCTarget:
     def load_entity_keys(self) -> set[tuple[str, str]]:
         conn = connect(self.config)
         try:
+            _ensure_entity_schema(conn)
             cursor = conn.cursor()
             cursor.execute("SELECT edc_name, sn FROM edc_entities")
             return {(str(row[0]), str(row[1] or "")) for row in cursor}
@@ -328,6 +327,25 @@ def _load_enabled_entities(conn) -> list[EDCEntity]:
 
 def _ensure_entity_schema(conn) -> None:
     cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS edc_entities (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          edc_name VARCHAR(255) NOT NULL,
+          sn VARCHAR(255) NOT NULL DEFAULT '',
+          display_name VARCHAR(255) NOT NULL,
+          region VARCHAR(255) NOT NULL,
+          cp VARCHAR(255) NOT NULL,
+          is_backup TINYINT(1) NOT NULL DEFAULT 0,
+          enabled TINYINT(1) NOT NULL DEFAULT 1,
+          remark TEXT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          UNIQUE KEY uq_edc_entities_name_sn (edc_name, sn)
+        )
+        """
+    )
+    conn.commit()
     cursor.execute(
         """
         SELECT COUNT(*)

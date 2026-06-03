@@ -88,9 +88,15 @@ async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise
     ...init
   });
   const text = await response.text();
-  const body = text ? JSON.parse(text) : {};
+  const contentType = response.headers.get("content-type") || "";
+  const isJson = contentType.includes("application/json");
+  const body = text && isJson ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(body.error || response.statusText || "请求失败");
+    const fallback = text && !isJson ? "服务器返回了非 JSON 响应" : response.statusText;
+    throw new Error(body.error || fallback || "请求失败");
+  }
+  if (text && !isJson) {
+    throw new Error("服务器返回了非 JSON 响应");
   }
   return body as T;
 }

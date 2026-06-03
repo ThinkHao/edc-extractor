@@ -153,11 +153,17 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
 
     @app.get("/api/source/entities")
     def source_entities():
-        start_time = _parse_time(request.args.get("start_time"))
-        end_time = _parse_time(request.args.get("end_time"))
-        limit = _parse_limit(request.args.get("limit"))
-        candidates = source.discover_entity_candidates(start_time, end_time, limit)
-        configured_keys = target.load_entity_keys()
+        try:
+            start_time = _parse_time(request.args.get("start_time"))
+            end_time = _parse_time(request.args.get("end_time"))
+            limit = _parse_limit(request.args.get("limit"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            candidates = source.discover_entity_candidates(start_time, end_time, limit)
+            configured_keys = target.load_entity_keys()
+        except Exception as exc:
+            return jsonify({"error": f"源端 EDC 发现失败: {exc}"}), 500
         payload = build_entity_payload(candidates, configured_keys)
         only_unconfigured = _parse_bool(request.args.get("only_unconfigured"), default=False)
         if only_unconfigured:
