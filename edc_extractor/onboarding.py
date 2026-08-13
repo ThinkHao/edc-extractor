@@ -43,8 +43,12 @@ class EDCOnboardingMonitor:
         notified = self.notify_pending(current)
         return {"discovered": len(candidates), "backfills_scheduled": scheduled, "notifications_sent": notified}
 
-    def process_pending(self) -> int:
-        pending = self.target.list_entity_candidates(statuses={"pending"}, limit=5000)
+    def process_pending(self, entity_keys: set[tuple[str, str]] | None = None) -> int:
+        pending = self.target.list_entity_candidates(
+            statuses={"pending"},
+            limit=5000,
+            entity_keys=entity_keys,
+        )
         entities = {
             (entity.edc_name, entity.sn or ""): entity
             for entity in self.target.load_enabled_entities()
@@ -85,7 +89,7 @@ class EDCOnboardingMonitor:
         sent = 0
         for candidate in self.target.list_entity_candidates(statuses={"pending", "failed"}, limit=5000):
             level = 3 if candidate.get("status") == "failed" else _notification_level(candidate, current)
-            if level <= int(candidate.get("last_notified_level") or 0):
+            if not _notification_due(candidate, current):
                 continue
             title = _notification_title(level)
             text = (
@@ -144,6 +148,13 @@ def _notification_level(candidate: dict, now: datetime) -> int:
     if age >= timedelta(hours=4):
         return 2
     return 1
+
+
+def _notification_due(candidate: dict, now: datetime) -> bool:
+    last_notified_at = candidate.get("last_notified_at")
+    if not isinstance(last_notified_at, datetime):
+        return True
+    return now - last_notified_at >= timedelta(hours=24)
 
 
 def _notification_title(level: int) -> str:

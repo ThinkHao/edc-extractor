@@ -560,8 +560,13 @@ export function App() {
     if (!form) return;
     setLoading((current) => ({ ...current, save: true }));
     try {
-      await saveEntity(form);
-      setNotice({ tone: "ok", text: `已写入映射：${form.edc_name}` });
+      const response = await saveEntity(form);
+      setNotice({
+        tone: "ok",
+        text: response.backfill_status === "scheduled"
+          ? `已写入映射：${form.edc_name}，历史补录已后台排队`
+          : `已写入映射：${form.edc_name}`
+      });
       await loadEntities();
     } catch (error) {
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "映射写入失败" });
@@ -579,7 +584,12 @@ export function App() {
     try {
       const payload = selectedEntities.map((item) => mappingForm(item)).filter((item): item is EntityPayload => item !== null);
       const response = await saveEntities(payload);
-      setNotice({ tone: "ok", text: `已批量写入 ${response.upserted} 条映射` });
+      setNotice({
+        tone: "ok",
+        text: response.backfill_status === "scheduled"
+          ? `已批量写入 ${response.upserted} 条映射，历史补录已后台排队`
+          : `已批量写入 ${response.upserted} 条映射`
+      });
       setSelectedKeys(new Set());
       await loadEntities();
     } catch (error) {

@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 from edc_extractor.entity_onboarding import SourceEntityCandidate
-from edc_extractor.onboarding import EDCOnboardingMonitor
+from edc_extractor.onboarding import EDCOnboardingMonitor, _notification_due
 from edc_extractor.sync_engine import EDCEntity, SyncConfig, SyncSummary
 
 
@@ -61,7 +61,7 @@ class FakeTarget:
             for c in candidates
         ]
 
-    def list_entity_candidates(self, statuses=None, limit=5000):
+    def list_entity_candidates(self, statuses=None, limit=5000, entity_keys=None):
         return [c for c in self.candidates if not statuses or c["status"] in statuses]
 
     def load_enabled_entities(self):
@@ -116,3 +116,9 @@ def test_monitor_notifies_and_schedules_exact_entity_backfill():
         assert engine.calls
         assert engine.calls[0][2] == {("BJ-new", "SN1")}
 
+
+def test_notification_is_at_most_once_per_24_hours():
+    now = datetime(2026, 8, 13, 10, 0)
+    assert _notification_due({"last_notified_at": None}, now)
+    assert not _notification_due({"last_notified_at": now - timedelta(hours=23, minutes=59)}, now)
+    assert _notification_due({"last_notified_at": now - timedelta(hours=24)}, now)

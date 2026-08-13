@@ -32,6 +32,7 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
     target = MySQLEDCTarget(config.target)
     engine = SyncEngine(source, target, config.sync)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="edc-sync")
+    onboarding_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="edc-onboarding")
     backfill_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="edc-backfill")
     notifier = FeishuNotificationClient(config.notification)
     onboarding = EDCOnboardingMonitor(
@@ -218,11 +219,19 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         upserted = target.upsert_entities(rows)
-        try:
-            onboarding.process_pending()
-        except Exception as exc:
-            app.logger.warning("写入映射后触发历史补录失败: %s", exc)
-        return jsonify({"upserted": upserted})
+        entity_keys = {
+            (str(row["edc_name"]).strip(), str(row.get("sn") or "").strip())
+            for row in rows
+        }
+
+        def schedule_backfill() -> None:
+            try:
+                onboarding.process_pending(entity_keys=entity_keys)
+            except Exception:
+                app.logger.exception("写入映射后触发历史补录失败")
+
+        onboarding_executor.submit(schedule_backfill)
+        return jsonify({"upserted": upserted, "backfill_status": "scheduled"}), 202
 
     @app.post("/api/sync")
     def sync():

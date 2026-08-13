@@ -192,7 +192,7 @@ export function saveEntity(item: EntityPayload) {
 }
 
 export function saveEntities(items: EntityPayload[]) {
-  return request<{ upserted: number }>("/api/entities", {
+  return request<{ upserted: number; backfill_status?: string }>("/api/entities", {
     method: "POST",
     body: JSON.stringify({ items })
   });

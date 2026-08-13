@@ -129,16 +129,26 @@ class MySQLEDCSource:
             conn.close()
 
     def get_entity_time_bounds(self, edc_name: str, sn: str) -> tuple[datetime | None, datetime | None]:
-        query = f"""
-        SELECT MIN(create_time) AS first_seen_create_time,
-               MAX(create_time) AS latest_create_time
-        FROM {self.config.table}
-        WHERE edc_name = %s AND COALESCE(sn, '') = %s
-        """
+        if sn:
+            query = f"""
+            SELECT MIN(create_time) AS first_seen_create_time,
+                   MAX(create_time) AS latest_create_time
+            FROM {self.config.table}
+            WHERE sn = %s AND edc_name = %s
+            """
+            params = (sn, edc_name)
+        else:
+            query = f"""
+            SELECT MIN(create_time) AS first_seen_create_time,
+                   MAX(create_time) AS latest_create_time
+            FROM {self.config.table}
+            WHERE edc_name = %s AND (sn IS NULL OR sn = '')
+            """
+            params = (edc_name,)
         conn = connect(self.config)
         try:
             cursor = conn.cursor(dictionary=True)
-            cursor.execute(query, (edc_name, sn or ""))
+            cursor.execute(query, params)
             row = cursor.fetchone() or {}
             return row.get("first_seen_create_time"), row.get("latest_create_time")
         finally:
@@ -346,7 +356,12 @@ class MySQLEDCTarget:
         finally:
             conn.close()
 
-    def list_entity_candidates(self, statuses: set[str] | None = None, limit: int = 500) -> list[dict]:
+    def list_entity_candidates(
+        self,
+        statuses: set[str] | None = None,
+        limit: int = 500,
+        entity_keys: set[tuple[str, str]] | None = None,
+    ) -> list[dict]:
         _ensure_candidate_schema_for_config(self.config)
         conn = connect(self.config)
         try:
@@ -357,6 +372,12 @@ class MySQLEDCTarget:
                 values = sorted(statuses)
                 where = " WHERE status IN (" + ",".join(["%s"] * len(values)) + ")"
                 params.extend(values)
+            if entity_keys:
+                key_conditions = []
+                for edc_name, sn in sorted(entity_keys):
+                    key_conditions.append("(edc_name = %s AND sn = %s)")
+                    params.extend((edc_name, sn or ""))
+                where += (" AND " if where else " WHERE ") + "(" + " OR ".join(key_conditions) + ")"
             cursor.execute(
                 "SELECT * FROM edc_entity_candidates" + where + " ORDER BY updated_at DESC, id DESC LIMIT %s",
                 [*params, max(1, min(int(limit), 5000))],

@@ -119,7 +119,7 @@ enabled = true
 
 ## EDC 录入提醒与历史补录
 
-`[scheduler] discovery_cron` 默认每 5 分钟扫描源端最近 24 小时的数据。未出现在 `edc_entities` 的精确 `(edc_name, sn)` 会进入 `edc_entity_candidates`：首次发现、超过 4 小时、超过 24 小时分别按级别提醒；确认映射后自动查询该实体在源端的最早/最近时间，按 5 分钟分片写入目标库，并将状态置为 `ready`。补录按 `(edc_name, sn)` 严格匹配，不会把同名不同 SN 的流量串到一起。
+`[scheduler] discovery_cron` 默认每 5 分钟扫描源端最近 24 小时的数据。未出现在 `edc_entities` 的精确 `(edc_name, sn)` 会进入 `edc_entity_candidates`；确认映射后接口立即返回，历史边界查询和补录在后台执行。飞书提醒按每条 EDC 记录控制，任意连续 24 小时最多提醒一次，不会因每次 5 分钟检查重复告警。补录按 `(edc_name, sn)` 严格匹配，不会把同名不同 SN 的流量串到一起。
 
 飞书通知默认关闭。生产建议使用环境变量注入凭据，不要把应用密钥写入配置文件：
 
