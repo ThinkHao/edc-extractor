@@ -313,6 +313,7 @@ class MySQLEDCTarget:
             (
                 candidate.edc_name.strip(),
                 candidate.sn.strip(),
+                1 if is_backup_edc_name(candidate.edc_name) else 0,
                 candidate.first_seen_create_time or candidate.latest_create_time,
                 candidate.latest_create_time,
                 int(candidate.record_count),
@@ -326,9 +327,10 @@ class MySQLEDCTarget:
             cursor.executemany(
                 """
                 INSERT INTO edc_entity_candidates
-                  (edc_name, sn, first_seen_at, latest_seen_at, record_count, status)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                  (edc_name, sn, is_backup, first_seen_at, latest_seen_at, record_count, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
+                  is_backup = VALUES(is_backup),
                   first_seen_at = LEAST(first_seen_at, VALUES(first_seen_at)),
                   latest_seen_at = GREATEST(latest_seen_at, VALUES(latest_seen_at)),
                   record_count = GREATEST(record_count, VALUES(record_count)),
@@ -736,6 +738,7 @@ def _ensure_candidate_schema_for_config(config: DBConfig) -> None:
               id BIGINT AUTO_INCREMENT PRIMARY KEY,
               edc_name VARCHAR(255) NOT NULL,
               sn VARCHAR(255) NOT NULL DEFAULT '',
+              is_backup TINYINT(1) NOT NULL DEFAULT 0,
               first_seen_at DATETIME NULL,
               latest_seen_at DATETIME NULL,
               record_count BIGINT NOT NULL DEFAULT 0,
@@ -757,5 +760,21 @@ def _ensure_candidate_schema_for_config(config: DBConfig) -> None:
             """
         )
         conn.commit()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'edc_entity_candidates'
+              AND COLUMN_NAME = 'is_backup'
+            """
+        )
+        row = cursor.fetchone()
+        if not row or int(row[0]) == 0:
+            cursor.execute("ALTER TABLE edc_entity_candidates ADD COLUMN is_backup TINYINT(1) NOT NULL DEFAULT 0 AFTER sn")
+            cursor.execute(
+                "UPDATE edc_entity_candidates SET is_backup = CASE WHEN LOWER(edc_name) LIKE '%backup%' THEN 1 ELSE 0 END"
+            )
+            conn.commit()
     finally:
         conn.close()
