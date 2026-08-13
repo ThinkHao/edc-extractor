@@ -126,6 +126,40 @@ def test_sync_engine_tracks_unmapped_rows_without_writing_them():
     assert target.rows == {}
 
 
+def test_sync_engine_clamps_negative_sizes_before_aggregation_and_reports_counts():
+    start = datetime(2026, 5, 1, 0, 0, 0)
+    source = FakeSource(
+        [
+            {
+                "create_time": start,
+                "edc_name": "node-a",
+                "sn": "SN1",
+                "service_size": 100,
+                "cache_size": 20,
+                "record_count": 1,
+            },
+            {
+                "create_time": start,
+                "edc_name": "node-a",
+                "sn": "SN1",
+                "service_size": -999999,
+                "cache_size": -888888,
+                "record_count": 1,
+            },
+        ]
+    )
+    target = FakeTarget(
+        [EDCEntity(id=30, edc_name="node-a", sn="SN1", display_name="node-a", region="北京", cp="ali")]
+    )
+
+    summary = SyncEngine(source, target).sync(start, start + timedelta(hours=1))
+
+    assert summary.negative_service_count == 1
+    assert summary.negative_cache_count == 1
+    assert target.rows[(start, 30)]["service_size"] == 100
+    assert target.rows[(start, 30)]["cache_size"] == 20
+
+
 def test_sync_engine_resolves_sn_change_when_edc_name_is_unique():
     start = datetime(2026, 5, 1, 0, 0, 0)
     source = FakeSource(

@@ -18,6 +18,10 @@ class EDCEntity:
     display_name: str
     region: str
     cp: str
+    entity_type: str | None = None
+    src_region: str | None = None
+    dst_region: str | None = None
+    alias: str | None = None
     is_backup: bool = False
 
 
@@ -37,6 +41,8 @@ class SyncChunkSummary:
     rows_read: int = 0
     rows_written: int = 0
     unmapped_count: int = 0
+    negative_service_count: int = 0
+    negative_cache_count: int = 0
     duration_ms: int = 0
     error: str | None = None
 
@@ -58,6 +64,14 @@ class SyncSummary:
     @property
     def unmapped_count(self) -> int:
         return sum(chunk.unmapped_count for chunk in self.chunks)
+
+    @property
+    def negative_service_count(self) -> int:
+        return sum(chunk.negative_service_count for chunk in self.chunks)
+
+    @property
+    def negative_cache_count(self) -> int:
+        return sum(chunk.negative_cache_count for chunk in self.chunks)
 
     @property
     def duration_ms(self) -> int:
@@ -112,11 +126,14 @@ class SyncEngine:
         start_time: datetime,
         end_time: datetime,
         progress_callback: Callable[[int, int, SyncChunkSummary, SyncSummary], None] | None = None,
+        entity_keys: set[tuple[str, str]] | None = None,
     ) -> SyncSummary:
         self._validate_range(start_time, end_time)
         chunks: list[SyncChunkSummary] = []
         with self._task_session(self.source) as source, self._task_session(self.target) as target:
             entities = target.load_enabled_entities()
+            if entity_keys is not None:
+                entities = [entity for entity in entities if (entity.edc_name, entity.sn or "") in entity_keys]
             entity_map = self._build_entity_map(entities)
             edc_names = sorted({entity.edc_name for entity in entities})
             time_chunks = build_time_chunks(start_time, end_time, self.config.chunk_hours)
@@ -174,8 +191,16 @@ class SyncEngine:
                         "record_count": 0,
                     },
                 )
-                row["service_size"] += int(source_row.get("service_size") or 0)
-                row["cache_size"] += int(source_row.get("cache_size") or 0)
+                service_size = int(source_row.get("service_size") or 0)
+                cache_size = int(source_row.get("cache_size") or 0)
+                if service_size < 0:
+                    summary.negative_service_count += 1
+                    service_size = 0
+                if cache_size < 0:
+                    summary.negative_cache_count += 1
+                    cache_size = 0
+                row["service_size"] += service_size
+                row["cache_size"] += cache_size
                 row["record_count"] += int(source_row.get("record_count") or 0)
 
         rows = list(aggregate.values())

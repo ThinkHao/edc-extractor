@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from typing import Callable
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -24,6 +25,7 @@ class EDCTaskScheduler:
         source_host: str,
         target_host: str,
         executor: ThreadPoolExecutor,
+        onboarding_cycle: Callable[[], object] | None = None,
     ):
         self.store = store
         self.engine = engine
@@ -31,6 +33,7 @@ class EDCTaskScheduler:
         self.source_host = source_host
         self.target_host = target_host
         self.executor = executor
+        self.onboarding_cycle = onboarding_cycle
         self.scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 
     def start(self) -> None:
@@ -64,6 +67,16 @@ class EDCTaskScheduler:
                 trigger=trigger,
                 args=[int(task["id"])],
                 id=self._job_id(task["id"]),
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
+        if self.onboarding_cycle:
+            trigger = CronTrigger.from_crontab(self.config.discovery_cron, timezone="Asia/Shanghai")
+            self.scheduler.add_job(
+                self.onboarding_cycle,
+                trigger=trigger,
+                id="edc-onboarding-monitor",
                 max_instances=1,
                 coalesce=True,
                 replace_existing=True,

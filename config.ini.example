@@ -28,9 +28,23 @@ debug = false
 
 [scheduler]
 default_cron = */10 * * * *
+discovery_cron = */5 * * * *
 time_window_minutes = 60
 delay_minutes = 10
 enabled = true
+
+[notification]
+enabled = false
+# 自建应用机器人模式：填入应用信息后，系统会通过 chat_id 发群消息并 @指定人员。
+app_id =
+app_secret =
+chat_id =
+mention_open_id =
+mention_name = 郝金鑫
+# 可选：已有群自定义机器人时可改用 webhook_url；与应用模式二选一。
+webhook_url =
+start_hour = 9
+end_hour = 18
 
 [sync]
 chunk_hours = 6

@@ -92,6 +92,22 @@ def test_events_stream_starts_with_snapshot(tmp_path, monkeypatch):
     assert "server_time" in payload
 
 
+def test_events_defaults_to_single_snapshot(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.ini"
+    write_config(config_path)
+    monkeypatch.setenv("EDC_SCHEDULER_DB", str(tmp_path / "scheduler.db"))
+    monkeypatch.setattr(web_module, "MySQLEDCSource", HealthySource)
+    monkeypatch.setattr(web_module, "MySQLEDCTarget", HealthyTarget)
+
+    app = web_module.create_app(config_path, start_scheduler=False)
+    response = app.test_client().get("/api/events")
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert body.count("event: snapshot") == 1
+    assert "event: heartbeat" not in body
+
+
 def test_events_snapshot_degrades_when_health_check_fails(tmp_path, monkeypatch):
     config_path = tmp_path / "config.ini"
     write_config(config_path)

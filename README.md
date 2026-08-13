@@ -44,6 +44,7 @@ cp config.ini.example config.ini
 docker run -d --name edc-extractor \
   --restart unless-stopped \
   -p 127.0.0.1:8081:8081 \
+  -e TZ=Asia/Shanghai \
   -e EDC_EXTRACTOR_CONFIG=/app/config.ini \
   -e EDC_SCHEDULER_DB=/app/data/scheduler.db \
   -v "$(pwd)/config.ini:/app/config.ini:ro" \
@@ -100,6 +101,7 @@ npm run dev
 - 标识 `backup` 备份数据。
 - 对未配置项确认并写入 `edc_entities`，主备状态会写入 `is_backup` 字段。
 - 手动触发同步、配置自动同步并查看执行记录。
+- 自动发现未登记的 `(edc_name, sn)`，保存待录入状态并按级别提醒；映射确认后从源端最早时间开始精确补录，补录失败可通过 API 重试。
 
 ## 自动同步
 
@@ -114,6 +116,25 @@ enabled = true
 ```
 
 默认含义是每 10 分钟执行一次，取“当前时间延迟 10 分钟后”的最近 60 分钟窗口，并把结束时间对齐到 5 分钟边界。启动后也可以在 Web 控制台的“同步任务”页面调整 cron、窗口、延迟和启停状态。
+
+## EDC 录入提醒与历史补录
+
+`[scheduler] discovery_cron` 默认每 5 分钟扫描源端最近 24 小时的数据。未出现在 `edc_entities` 的精确 `(edc_name, sn)` 会进入 `edc_entity_candidates`：首次发现、超过 4 小时、超过 24 小时分别按级别提醒；确认映射后自动查询该实体在源端的最早/最近时间，按 5 分钟分片写入目标库，并将状态置为 `ready`。补录按 `(edc_name, sn)` 严格匹配，不会把同名不同 SN 的流量串到一起。
+
+飞书通知默认关闭。生产建议使用环境变量注入凭据，不要把应用密钥写入配置文件：
+
+```text
+EDC_FEISHU_ENABLED=true
+EDC_FEISHU_APP_ID=...
+EDC_FEISHU_APP_SECRET=...
+EDC_FEISHU_CHAT_ID=oc_...
+EDC_FEISHU_MENTION_OPEN_ID=ou_...
+EDC_FEISHU_MENTION_NAME=郝金鑫
+EDC_FEISHU_START_HOUR=9
+EDC_FEISHU_END_HOUR=18
+```
+
+也可以配置 `EDC_FEISHU_WEBHOOK_URL` 使用群自定义机器人。录入状态通过 `GET /api/onboarding` 查询；补录失败后可调用 `POST /api/onboarding/<candidate_id>/retry` 重试。
 
 `config.ini`、`.env`、前端依赖、构建产物和运行态数据库已在 `.gitignore` 中忽略，不要提交真实数据库密码。
 

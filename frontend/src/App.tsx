@@ -21,12 +21,15 @@ import {
 import {
   discoverEntities,
   EntityPayload,
+  EntityType,
   Execution,
   ExecutionProgress,
   getTasks,
   getExecutions,
   getHealth,
+  getOnboarding,
   Health,
+  OnboardingState,
   runTask,
   runSync,
   saveEntity,
@@ -42,11 +45,21 @@ type ViewKey = "状态" | "EDC发现" | "映射录入" | "同步任务" | "执�
 type RangeSelectMode = "start" | "end";
 type SseState = "connecting" | "connected" | "fallback";
 
+type SseLease = {
+  owner: string;
+  expiresAt: number;
+};
+
+const SSE_LEASE_KEY = "edc-extractor:sse-owner";
+const SSE_LEASE_TTL_MS = 20000;
+const SSE_LEASE_RENEW_MS = 10000;
+
 type SseSnapshot = {
   tasks?: ScheduledTask[];
   executions?: Execution[];
   active_execution?: Execution | null;
   health?: Health;
+  onboarding?: OnboardingState;
 };
 
 const navItems: Array<{ label: ViewKey; icon: typeof Activity }> = [
@@ -144,15 +157,37 @@ function fullDayEnd(date: string) {
   return `${date} 23:59:59`;
 }
 
-function guessMapping(row: SourceEntity): EntityPayload {
+function mappingForm(row: SourceEntity): EntityPayload | null {
+  const entityType: EntityType = row.entity_type === "transmission" ? "transmission" : "node";
+  if (row.configured && row.display_name !== undefined && row.region !== undefined && row.cp !== undefined) {
+    return {
+      edc_name: row.edc_name,
+      sn: row.sn,
+      display_name: row.display_name,
+      alias: row.alias || "",
+      region: row.region,
+      cp: row.cp,
+      entity_type: entityType,
+      src_region: row.src_region || "",
+      dst_region: row.dst_region || "",
+      is_backup: row.is_backup,
+      enabled: row.enabled ?? true,
+      remark: row.remark || ""
+    };
+  }
+  if (row.configured) return null;
   const displayName = row.edc_name.replace(/-backup/gi, "");
   const parts = displayName.split("-");
   return {
     edc_name: row.edc_name,
     sn: row.sn,
     display_name: displayName,
+    alias: row.alias || "",
     region: parts[0] || "",
     cp: parts[1] || "",
+    entity_type: entityType,
+    src_region: row.src_region || "",
+    dst_region: row.dst_region || "",
     is_backup: row.is_backup,
     enabled: true,
     remark: row.is_backup ? "备份数据源，暂不自动补录" : ""
@@ -176,6 +211,7 @@ function formatNextRun(value: string) {
 export function App() {
   const initialRange = useMemo(defaultRange, []);
   const [health, setHealth] = useState<Health | null>(null);
+  const [onboarding, setOnboarding] = useState<OnboardingState>({ items: [], counts: {} });
   const [executions, setExecutions] = useState<Execution[]>([]);
   const [entities, setEntities] = useState<SourceEntity[]>([]);
   const [selected, setSelected] = useState<SourceEntity | null>(null);
@@ -233,7 +269,7 @@ export function App() {
   }, [taskDirty]);
 
   const refreshOperationalState = useCallback(async () => {
-    await Promise.all([loadHealth(), loadExecutions(), loadTasks()]);
+    await Promise.all([loadHealth(), loadExecutions(), loadTasks(), getOnboarding().then(setOnboarding).catch(() => undefined)]);
   }, [loadExecutions, loadHealth, loadTasks]);
 
   const applyTasks = useCallback((items: ScheduledTask[]) => {
@@ -253,6 +289,8 @@ export function App() {
       rows_read: tracked.rows_read,
       rows_written: tracked.rows_written,
       unmapped_count: tracked.unmapped_count,
+      negative_service_count: tracked.negative_service_count,
+      negative_cache_count: tracked.negative_cache_count,
       duration_ms: tracked.duration_ms
     });
     setActiveExecutionId(null);
@@ -266,6 +304,9 @@ export function App() {
   const applySnapshot = useCallback((payload: SseSnapshot) => {
     if (payload.health) {
       setHealth(payload.health);
+    }
+    if (payload.onboarding) {
+      setOnboarding(payload.onboarding);
     }
     if (payload.tasks) {
       applyTasks(payload.tasks);
@@ -297,9 +338,18 @@ export function App() {
       setEntities(response.items);
       const nextSelected = response.items[0] || null;
       setSelected(nextSelected);
-      setForm(nextSelected ? guessMapping(nextSelected) : null);
+      setForm(nextSelected ? mappingForm(nextSelected) : null);
       setSelectedKeys(new Set());
-      setNotice({ tone: "ok", text: `已发现 ${response.items.length} 条 EDC 名称` });
+      const unconfiguredCount = response.items.filter((item) => !item.configured).length;
+      setNotice({
+        tone: "ok",
+        text:
+          response.items.length === 0 && onlyUnconfigured
+            ? "未发现新的未配置 EDC，取消勾选“仅未配置”可查看全部已配置项"
+            : onlyUnconfigured
+              ? `已发现 ${response.items.length} 条未配置 EDC 名称`
+              : `已发现 ${response.items.length} 条 EDC 名称，其中 ${unconfiguredCount} 条未配置`,
+      });
     } catch (error) {
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "EDC 发现失败" });
     } finally {
@@ -336,18 +386,78 @@ export function App() {
   }, [loadHealth, sseState]);
 
   useEffect(() => {
+    const shouldUseSse = activeView === "同步任务" || activeView === "执行记录";
     let source: EventSource | null = null;
     let reconnectTimer = 0;
+    let leaseTimer = 0;
     let closed = false;
+    const tabId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    const readLease = (): SseLease | null => {
+      try {
+        const raw = window.localStorage.getItem(SSE_LEASE_KEY);
+        return raw ? (JSON.parse(raw) as SseLease) : null;
+      } catch {
+        return null;
+      }
+    };
+
+    const writeLease = () => {
+      try {
+        window.localStorage.setItem(
+          SSE_LEASE_KEY,
+          JSON.stringify({ owner: tabId, expiresAt: Date.now() + SSE_LEASE_TTL_MS }),
+        );
+      } catch {
+        return;
+      }
+    };
+
+    const acquireLease = () => {
+      const lease = readLease();
+      if (lease && lease.owner !== tabId && lease.expiresAt > Date.now()) {
+        return false;
+      }
+      writeLease();
+      return true;
+    };
+
+    const releaseLease = () => {
+      const lease = readLease();
+      if (!lease || lease.owner !== tabId) return;
+      try {
+        window.localStorage.removeItem(SSE_LEASE_KEY);
+      } catch {
+        return;
+      }
+    };
+
+    const closeSource = () => {
+      source?.close();
+      source = null;
+      window.clearInterval(leaseTimer);
+      releaseLease();
+    };
 
     const connect = () => {
-      if (closed || document.visibilityState === "hidden") return;
+      if (closed || !shouldUseSse || source || document.visibilityState === "hidden") return;
+      if (!acquireLease()) {
+        setSseState("fallback");
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = window.setTimeout(connect, 5000);
+        return;
+      }
       setSseState((current) => (current === "connected" ? current : "connecting"));
-      source = new EventSource("/api/events");
-      source.onopen = () => setSseState("connected");
+      source = new EventSource("/api/events?stream=true");
+      source.onopen = () => {
+        writeLease();
+        window.clearInterval(leaseTimer);
+        leaseTimer = window.setInterval(writeLease, SSE_LEASE_RENEW_MS);
+        setSseState("connected");
+      };
       source.onerror = () => {
         setSseState("fallback");
-        source?.close();
+        closeSource();
         if (!closed) {
           window.clearTimeout(reconnectTimer);
           reconnectTimer = window.setTimeout(connect, 5000);
@@ -356,6 +466,7 @@ export function App() {
       source.addEventListener("snapshot", (event) => applySnapshot(parseEventData(event)));
       source.addEventListener("tasks", (event) => applyTasks(parseEventData<{ items: ScheduledTask[] }>(event).items || []));
       source.addEventListener("executions", (event) => applyExecutions(parseEventData<{ items: Execution[] }>(event).items || []));
+      source.addEventListener("onboarding", (event) => setOnboarding(parseEventData<OnboardingState>(event)));
       source.addEventListener("active_execution", (event) => applySnapshot({ active_execution: parseEventData<Execution | null>(event) }));
       source.addEventListener("health", (event) => setHealth(parseEventData<Health>(event)));
       source.addEventListener("error", (event) => {
@@ -366,8 +477,7 @@ export function App() {
 
     const handleVisibility = () => {
       if (document.visibilityState === "hidden") {
-        source?.close();
-        source = null;
+        closeSource();
         setSseState("fallback");
         return;
       }
@@ -375,15 +485,27 @@ export function App() {
       void refreshOperationalState();
     };
 
-    connect();
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== SSE_LEASE_KEY || closed || source || document.visibilityState === "hidden") return;
+      connect();
+    };
+
+    if (shouldUseSse) {
+      connect();
+    } else {
+      setSseState("fallback");
+    }
     document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("storage", handleStorage);
     return () => {
       closed = true;
       window.clearTimeout(reconnectTimer);
+      window.clearInterval(leaseTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
-      source?.close();
+      window.removeEventListener("storage", handleStorage);
+      closeSource();
     };
-  }, [applySnapshot, applyTasks, refreshOperationalState]);
+  }, [activeView, applySnapshot, applyTasks, refreshOperationalState]);
 
   useEffect(() => {
     if (activeExecutionId || sseState === "connected") return;
@@ -405,7 +527,7 @@ export function App() {
 
   function selectEntity(row: SourceEntity) {
     setSelected(row);
-    setForm(guessMapping(row));
+    setForm(mappingForm(row));
     setNotice(null);
   }
 
@@ -455,7 +577,7 @@ export function App() {
     }
     setLoading((current) => ({ ...current, save: true }));
     try {
-      const payload = selectedEntities.map(guessMapping);
+      const payload = selectedEntities.map((item) => mappingForm(item)).filter((item): item is EntityPayload => item !== null);
       const response = await saveEntities(payload);
       setNotice({ tone: "ok", text: `已批量写入 ${response.upserted} 条映射` });
       setSelectedKeys(new Set());
@@ -481,6 +603,8 @@ export function App() {
         rows_read: 0,
         rows_written: 0,
         unmapped_count: 0,
+        negative_service_count: 0,
+        negative_cache_count: 0,
         duration_ms: 0,
         error_message: null,
         progress_info: null,
@@ -631,10 +755,15 @@ export function App() {
         {notice && <div className={`notice ${notice.tone}`}>{notice.text}</div>}
 
         {activeView === "状态" && (
-        <section className="metrics-row view-only">
-          <Metric label="发现项" value={String(entities.length)} icon={<Database size={17} />} />
-          <Metric label="未配置" value={String(unconfiguredCount)} icon={<Filter size={17} />} />
-          <Metric label="备份数据" value={String(backupCount)} icon={<ShieldCheck size={17} />} />
+         <section className="metrics-row view-only">
+           <Metric label="发现项" value={String(entities.length)} icon={<Database size={17} />} />
+           <Metric label="未配置" value={String(unconfiguredCount)} icon={<Filter size={17} />} />
+           <Metric
+             label="补录待处理"
+             value={String((onboarding.counts.pending || 0) + (onboarding.counts.backfill_pending || 0) + (onboarding.counts.backfilling || 0))}
+             icon={<Clock3 size={17} />}
+           />
+           <Metric label="备份数据" value={String(backupCount)} icon={<ShieldCheck size={17} />} />
           <Metric label="最近执行" value={executions[0]?.status || "暂无"} icon={<Clock3 size={17} />} />
         </section>
         )}
@@ -780,12 +909,38 @@ export function App() {
                   <input value={form.display_name} onChange={(event) => setForm({ ...form, display_name: event.target.value })} />
                 </label>
                 <label>
+                  识别别名
+                  <input
+                    value={form.alias}
+                    placeholder="可选，便于 dashboard 识别"
+                    onChange={(event) => setForm({ ...form, alias: event.target.value })}
+                  />
+                </label>
+                <label>
                   地区
                   <input value={form.region} onChange={(event) => setForm({ ...form, region: event.target.value })} />
                 </label>
                 <label>
                   CP
                   <input value={form.cp} onChange={(event) => setForm({ ...form, cp: event.target.value })} />
+                </label>
+                <label>
+                  类型
+                  <select
+                    value={form.entity_type}
+                    onChange={(event) => setForm({ ...form, entity_type: event.target.value as EntityType })}
+                  >
+                    <option value="node">节点</option>
+                    <option value="transmission">传输</option>
+                  </select>
+                </label>
+                <label>
+                  源区域
+                  <input value={form.src_region} onChange={(event) => setForm({ ...form, src_region: event.target.value })} />
+                </label>
+                <label>
+                  目区域
+                  <input value={form.dst_region} onChange={(event) => setForm({ ...form, dst_region: event.target.value })} />
                 </label>
                 <label className="switch-row">
                   <input
@@ -898,6 +1053,8 @@ export function App() {
                 <span>读取 {lastSync.rows_read ?? 0}</span>
                 <span>写入 {lastSync.rows_written ?? 0}</span>
                 <span>未映射 {lastSync.unmapped_count ?? 0}</span>
+                <span>服务负值修正 {lastSync.negative_service_count ?? 0}</span>
+                <span>回源负值修正 {lastSync.negative_cache_count ?? 0}</span>
               </div>
             )}
             {activeExecution && (
@@ -1038,6 +1195,8 @@ function SyncProgress({ execution }: { execution: Execution }) {
         <span>读取 {execution.rows_read}</span>
         <span>写入 {execution.rows_written}</span>
         <span>未映射 {execution.unmapped_count}</span>
+        <span>服务负值修正 {progress.negative_service_count || 0}</span>
+        <span>回源负值修正 {progress.negative_cache_count || 0}</span>
       </div>
       {progress.current_start_time && progress.current_end_time && (
         <small>{progress.current_start_time} 至 {progress.current_end_time}</small>

@@ -10,8 +10,10 @@ from time import sleep
 from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
 
 from .config import load_config
-from .entity_onboarding import build_entity_payload
+from .entity_onboarding import ENTITY_TYPES, build_entity_payload
 from .mysql_adapters import MySQLEDCSource, MySQLEDCTarget
+from .notification import FeishuNotificationClient
+from .onboarding import EDCOnboardingMonitor
 from .scheduler_store import SchedulerStore
 from .sync_jobs import describe_sync_error, run_sync_job
 from .sync_engine import SyncEngine
@@ -30,6 +32,16 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
     target = MySQLEDCTarget(config.target)
     engine = SyncEngine(source, target, config.sync)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="edc-sync")
+    backfill_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="edc-backfill")
+    notifier = FeishuNotificationClient(config.notification)
+    onboarding = EDCOnboardingMonitor(
+        source=source,
+        target=target,
+        engine=engine,
+        notifier=notifier,
+        backfill_executor=backfill_executor,
+        sync_config=config.sync,
+    )
     task_scheduler = EDCTaskScheduler(
         store=store,
         engine=engine,
@@ -37,8 +49,11 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
         source_host=config.source.host,
         target_host=config.target.host,
         executor=executor,
+        onboarding_cycle=onboarding.run_cycle,
     )
     app.extensions["edc_task_scheduler"] = task_scheduler
+    app.extensions["edc_onboarding"] = onboarding
+    app.extensions["edc_notifier"] = notifier
     task_scheduler.ensure_default_task()
     if start_scheduler is None:
         start_scheduler = os.environ.get("EDC_DISABLE_SCHEDULER") != "1" and (
@@ -82,13 +97,31 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
             return jsonify({"error": "execution not found"}), 404
         return jsonify(item)
 
+    @app.get("/api/onboarding")
+    def onboarding_state():
+        try:
+            return jsonify(build_onboarding_payload(target))
+        except Exception as exc:
+            return jsonify({"error": f"获取 EDC 录入状态失败: {exc}"}), 500
+
+    @app.post("/api/onboarding/<int:candidate_id>/retry")
+    def retry_onboarding(candidate_id: int):
+        try:
+            if not target.reset_candidate_for_retry(candidate_id):
+                return jsonify({"error": "候选记录不存在，或当前状态不可重试"}), 409
+            scheduled = onboarding.process_pending()
+            return jsonify({"candidate_id": candidate_id, "backfills_scheduled": scheduled})
+        except Exception as exc:
+            return jsonify({"error": f"重试 EDC 补录失败: {exc}"}), 500
+
     @app.get("/api/tasks")
     def tasks():
         return jsonify({"items": build_tasks_payload(store, task_scheduler)})
 
     @app.get("/api/events")
     def events():
-        once = _parse_bool(request.args.get("once"), default=False)
+        stream = _parse_bool(request.args.get("stream"), default=False)
+        once = _parse_bool(request.args.get("once"), default=not stream)
 
         def generate():
             yield _sse_event("snapshot", build_snapshot_payload(store, task_scheduler, source, target, config))
@@ -104,6 +137,7 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
                     if ticks % 5 == 0:
                         yield _sse_event("tasks", {"items": build_tasks_payload(store, task_scheduler)})
                         yield _sse_event("executions", {"items": build_executions_payload(store)})
+                        yield _sse_event("onboarding", build_onboarding_payload(target))
                     if ticks % 30 == 0:
                         yield _sse_event("health", build_health_payload(source, target, config))
                     if ticks % 15 == 0:
@@ -161,10 +195,13 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
             return jsonify({"error": str(exc)}), 400
         try:
             candidates = source.discover_entity_candidates(start_time, end_time, limit)
-            configured_keys = target.load_entity_keys()
+            configured_entities = target.load_entity_mappings()
+            upsert_candidates = getattr(target, "upsert_entity_candidates", None)
+            if callable(upsert_candidates):
+                upsert_candidates(candidates, configured_keys=set(configured_entities))
         except Exception as exc:
             return jsonify({"error": f"源端 EDC 发现失败: {exc}"}), 500
-        payload = build_entity_payload(candidates, configured_keys)
+        payload = build_entity_payload(candidates, configured_entities)
         only_unconfigured = _parse_bool(request.args.get("only_unconfigured"), default=False)
         if only_unconfigured:
             payload = [item for item in payload if not item["configured"]]
@@ -180,7 +217,12 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
             _validate_entity_rows(rows)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        return jsonify({"upserted": target.upsert_entities(rows)})
+        upserted = target.upsert_entities(rows)
+        try:
+            onboarding.process_pending()
+        except Exception as exc:
+            app.logger.warning("写入映射后触发历史补录失败: %s", exc)
+        return jsonify({"upserted": upserted})
 
     @app.post("/api/sync")
     def sync():
@@ -239,6 +281,9 @@ def _validate_entity_rows(rows: list[dict]) -> None:
         missing = [field for field in required if not str(row.get(field) or "").strip()]
         if missing:
             raise ValueError(f"items[{index}] missing required fields: {', '.join(missing)}")
+        entity_type = str(row.get("entity_type") or "").strip()
+        if entity_type not in ENTITY_TYPES:
+            raise ValueError(f"items[{index}].entity_type must be one of: {', '.join(ENTITY_TYPES)}")
 
 
 def build_snapshot_payload(
@@ -253,6 +298,7 @@ def build_snapshot_payload(
         "executions": build_executions_payload(store),
         "active_execution": build_active_execution_payload(store),
         "health": build_health_payload(source, target, config),
+        "onboarding": build_onboarding_payload(target),
         "server_time": _server_time(),
     }
 
@@ -263,6 +309,38 @@ def build_tasks_payload(store: SchedulerStore, task_scheduler: EDCTaskScheduler)
 
 def build_executions_payload(store: SchedulerStore) -> list[dict]:
     return store.list_executions()
+
+
+def build_onboarding_payload(target) -> dict:
+    list_candidates = getattr(target, "list_entity_candidates", None)
+    if not callable(list_candidates):
+        return {"items": [], "counts": {}}
+    items = list_candidates(limit=5000)
+    serialized = [_serialize_candidate(item) for item in items]
+    counts: dict[str, int] = {}
+    for item in serialized:
+        status = str(item.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return {"items": serialized, "counts": counts}
+
+
+def _serialize_candidate(item: dict) -> dict:
+    out = dict(item)
+    for key in (
+        "first_seen_at",
+        "latest_seen_at",
+        "last_notified_at",
+        "backfill_start_at",
+        "backfill_end_at",
+        "discovered_at",
+        "confirmed_at",
+        "backfill_completed_at",
+        "updated_at",
+    ):
+        value = out.get(key)
+        if isinstance(value, datetime):
+            out[key] = value.isoformat(sep=" ")
+    return out
 
 
 def build_active_execution_payload(store: SchedulerStore) -> dict | None:

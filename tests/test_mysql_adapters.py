@@ -69,6 +69,9 @@ def test_upsert_entities_writes_explicit_backup_flag(monkeypatch):
                 "display_name": "TJ-Bilibili",
                 "region": "天津",
                 "cp": "bilibili",
+                "entity_type": "node",
+                "src_region": "北京市",
+                "dst_region": "天津市",
                 "enabled": True,
                 "is_backup": True,
                 "remark": "backup node",
@@ -79,7 +82,7 @@ def test_upsert_entities_writes_explicit_backup_flag(monkeypatch):
     query = conn.cursor_obj.executemany_query
     payload = conn.cursor_obj.executemany_payload
     assert "is_backup" in query
-    assert payload[0][5] == 1
+    assert payload[0][9] == 1
 
 
 def test_load_entity_keys_ensures_schema_before_read(monkeypatch):
@@ -105,6 +108,47 @@ def test_load_entity_keys_ensures_schema_before_read(monkeypatch):
     assert calls == [conn]
 
 
+def test_load_entity_mappings_reads_manual_fields(monkeypatch):
+    conn = FakeSelectConnection(
+        [
+            {
+                "edc_name": "BJ-ali-01",
+                "sn": "SN1",
+                "display_name": "BJ-ali-01",
+                "region": "北京市",
+                "cp": "阿里",
+                "is_backup": 0,
+                "enabled": 1,
+                "remark": "人工录入",
+            }
+        ]
+    )
+    calls = []
+
+    def fake_ensure_schema(schema_conn):
+        calls.append(schema_conn)
+
+    monkeypatch.setattr(mysql_adapters, "connect", lambda config: conn)
+    monkeypatch.setattr(mysql_adapters, "_ensure_entity_schema", fake_ensure_schema)
+    target = MySQLEDCTarget(
+        DBConfig(
+            host="localhost",
+            port=3306,
+            user="root",
+            password="",
+            database="nfa",
+        )
+    )
+
+    mappings = target.load_entity_mappings()
+
+    assert mappings[("BJ-ali-01", "SN1")].region == "北京市"
+    assert mappings[("BJ-ali-01", "SN1")].cp == "阿里"
+    assert mappings[("BJ-ali-01", "SN1")].enabled is True
+    assert mappings[("BJ-ali-01", "SN1")].remark == "人工录入"
+    assert calls == [conn]
+
+
 def test_ensure_entity_schema_creates_mapping_table():
     conn = FakeSchemaConnection(column_count=1, index_count=1)
 
@@ -119,6 +163,9 @@ class FakeSelectConnection:
 
     def cursor(self, dictionary=False):
         return FakeSelectCursor(self.rows)
+
+    def close(self):
+        return None
 
 
 class FakeSelectCursor:
@@ -171,7 +218,7 @@ class FakeWriteConnection:
 
 class FakeSchemaCursor:
     def __init__(self, column_count, index_count):
-        self.results = [(column_count,), (index_count,)]
+        self.results = [(column_count,)] * 4 + [(column_count,), (column_count,), (column_count,), (index_count,)]
         self.executed_queries = []
 
     def execute(self, query, params=None):

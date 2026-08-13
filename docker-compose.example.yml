@@ -6,8 +6,18 @@ services:
     ports:
       - "127.0.0.1:8081:8081"
     environment:
+      TZ: Asia/Shanghai
       EDC_EXTRACTOR_CONFIG: /app/config.ini
       EDC_SCHEDULER_DB: /app/data/scheduler.db
+      # 飞书凭据请通过部署环境注入，不要写入镜像或提交到仓库。
+      EDC_FEISHU_ENABLED: ${EDC_FEISHU_ENABLED:-false}
+      EDC_FEISHU_APP_ID: ${EDC_FEISHU_APP_ID:-}
+      EDC_FEISHU_APP_SECRET: ${EDC_FEISHU_APP_SECRET:-}
+      EDC_FEISHU_CHAT_ID: ${EDC_FEISHU_CHAT_ID:-}
+      EDC_FEISHU_MENTION_OPEN_ID: ${EDC_FEISHU_MENTION_OPEN_ID:-}
+      EDC_FEISHU_MENTION_NAME: ${EDC_FEISHU_MENTION_NAME:-郝金鑫}
+      EDC_FEISHU_START_HOUR: ${EDC_FEISHU_START_HOUR:-9}
+      EDC_FEISHU_END_HOUR: ${EDC_FEISHU_END_HOUR:-18}
     volumes:
       - ./config.ini:/app/config.ini:ro
       - edc-extractor-data:/app/data

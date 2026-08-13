@@ -10,6 +10,7 @@ RUN npm run build
 FROM python:3.12-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai \
     EDC_EXTRACTOR_CONFIG=/app/config.ini \
     EDC_SCHEDULER_DB=/app/data/scheduler.db
 

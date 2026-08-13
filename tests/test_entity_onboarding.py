@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from edc_extractor.entity_onboarding import (
+    ConfiguredEntityMapping,
     SourceEntityCandidate,
     build_entity_payload,
     is_backup_edc_name,
@@ -29,7 +30,24 @@ def test_build_entity_payload_marks_configured_and_backup_candidates():
         ),
     ]
 
-    payload = build_entity_payload(candidates, {("TJ-Bilibili", "TJM1808960134")})
+    payload = build_entity_payload(
+        candidates,
+        {
+            ("TJ-Bilibili", "TJM1808960134"): ConfiguredEntityMapping(
+                edc_name="TJ-Bilibili",
+                sn="TJM1808960134",
+                display_name="天津-Bilibili",
+            region="天津",
+            cp="bilibili",
+            is_backup=False,
+            enabled=True,
+            remark="人工确认",
+            entity_type="node",
+            src_region="北京市",
+            dst_region="天津市",
+            )
+        },
+    )
 
     assert payload == [
         {
@@ -47,5 +65,14 @@ def test_build_entity_payload_marks_configured_and_backup_candidates():
             "record_count": 10,
             "is_backup": False,
             "configured": True,
+            "display_name": "天津-Bilibili",
+            "alias": None,
+            "region": "天津",
+            "cp": "bilibili",
+            "entity_type": "node",
+            "src_region": "北京市",
+            "dst_region": "天津市",
+            "enabled": True,
+            "remark": "人工确认",
         },
     ]

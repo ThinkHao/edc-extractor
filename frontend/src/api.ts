@@ -22,18 +22,33 @@ export type SourceEntity = {
   record_count: number;
   is_backup: boolean;
   configured: boolean;
+  display_name?: string;
+  alias?: string | null;
+  region?: string;
+  cp?: string;
+  entity_type?: EntityType | null;
+  src_region?: string | null;
+  dst_region?: string | null;
+  enabled?: boolean;
+  remark?: string;
 };
 
 export type EntityPayload = {
   edc_name: string;
   sn: string;
   display_name: string;
+  alias: string;
   region: string;
   cp: string;
+  entity_type: EntityType;
+  src_region: string;
+  dst_region: string;
   is_backup: boolean;
   enabled: boolean;
   remark: string;
 };
+
+export type EntityType = "node" | "transmission";
 
 export type Execution = {
   id: number;
@@ -43,6 +58,8 @@ export type Execution = {
   rows_read: number;
   rows_written: number;
   unmapped_count: number;
+  negative_service_count?: number;
+  negative_cache_count?: number;
   duration_ms: number;
   error_message: string | null;
   progress_info: string | null;
@@ -55,6 +72,8 @@ export type SyncResult = {
   rows_read?: number;
   rows_written?: number;
   unmapped_count?: number;
+  negative_service_count?: number;
+  negative_cache_count?: number;
   duration_ms?: number;
   error?: string;
 };
@@ -68,6 +87,8 @@ export type ExecutionProgress = {
   rows_read?: number;
   rows_written?: number;
   unmapped_count?: number;
+  negative_service_count?: number;
+  negative_cache_count?: number;
   duration_ms?: number;
 };
 
@@ -82,11 +103,39 @@ export type ScheduledTask = {
   updated_at: string;
 };
 
+export type OnboardingCandidate = {
+  id: number;
+  edc_name: string;
+  sn: string;
+  status: string;
+  first_seen_at: string | null;
+  latest_seen_at: string | null;
+  backfill_error: string | null;
+  backfill_rows: number;
+};
+
+export type OnboardingState = {
+  items: OnboardingCandidate[];
+  counts: Record<string, number>;
+};
+
 async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, {
+  const requestInit = {
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
     ...init
-  });
+  };
+  let response: Response;
+  try {
+    response = await fetch(input, requestInit);
+  } catch (error) {
+    if (!shouldRetryFetch(input, init)) throw error;
+    await wait(800);
+    try {
+      response = await fetch(input, requestInit);
+    } catch (retryError) {
+      throw retryError instanceof Error ? new Error(`请求连接失败，请稍后重试：${retryError.message}`) : retryError;
+    }
+  }
   const text = await response.text();
   const contentType = response.headers.get("content-type") || "";
   const isJson = contentType.includes("application/json");
@@ -99,6 +148,16 @@ async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise
     throw new Error("服务器返回了非 JSON 响应");
   }
   return body as T;
+}
+
+function shouldRetryFetch(input: RequestInfo | URL, init?: RequestInit) {
+  const method = (init?.method || "GET").toUpperCase();
+  const url = String(input);
+  return method === "GET" || (method === "POST" && url === "/api/entities");
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 export function getHealth() {
@@ -148,6 +207,10 @@ export function runSync(startTime: string, endTime: string) {
 
 export function getTasks() {
   return request<{ items: ScheduledTask[] }>("/api/tasks");
+}
+
+export function getOnboarding() {
+  return request<OnboardingState>("/api/onboarding");
 }
 
 export function updateTask(id: number, payload: Pick<ScheduledTask, "cron_expression" | "time_window_minutes" | "delay_minutes" | "enabled">) {

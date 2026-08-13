@@ -27,6 +27,7 @@ class AppConfig:
     target: DBConfig
     sync: SyncConfig
     scheduler: "SchedulerConfig"
+    notification: "NotificationConfig"
     app_host: str
     app_port: int
     debug: bool
@@ -38,6 +39,20 @@ class SchedulerConfig:
     time_window_minutes: int
     delay_minutes: int
     enabled: bool = True
+    discovery_cron: str = "*/5 * * * *"
+
+
+@dataclass(frozen=True)
+class NotificationConfig:
+    enabled: bool = False
+    app_id: str = ""
+    app_secret: str = ""
+    chat_id: str = ""
+    mention_open_id: str = ""
+    mention_name: str = "郝金鑫"
+    webhook_url: str = ""
+    start_hour: int = 9
+    end_hour: int = 18
 
 
 def load_config(path: str | Path = "config.ini") -> AppConfig:
@@ -59,16 +74,59 @@ def load_config(path: str | Path = "config.ini") -> AppConfig:
         time_window_minutes=parser.getint("scheduler", "time_window_minutes", fallback=60),
         delay_minutes=parser.getint("scheduler", "delay_minutes", fallback=10),
         enabled=parser.getboolean("scheduler", "enabled", fallback=True),
+        discovery_cron=parser.get("scheduler", "discovery_cron", fallback="*/5 * * * *"),
+    )
+    notification = NotificationConfig(
+        enabled=_env_bool_or_config(parser, "notification", "enabled", "EDC_FEISHU_ENABLED", False),
+        app_id=_env_or_config(parser, "notification", "app_id", "EDC_FEISHU_APP_ID"),
+        app_secret=_env_or_config(parser, "notification", "app_secret", "EDC_FEISHU_APP_SECRET"),
+        chat_id=_env_or_config(parser, "notification", "chat_id", "EDC_FEISHU_CHAT_ID"),
+        mention_open_id=_env_or_config(parser, "notification", "mention_open_id", "EDC_FEISHU_MENTION_OPEN_ID"),
+        mention_name=_env_or_config(parser, "notification", "mention_name", "EDC_FEISHU_MENTION_NAME") or "郝金鑫",
+        webhook_url=_env_or_config(parser, "notification", "webhook_url", "EDC_FEISHU_WEBHOOK_URL"),
+        start_hour=_env_int_or_config(parser, "notification", "start_hour", "EDC_FEISHU_START_HOUR", 9),
+        end_hour=_env_int_or_config(parser, "notification", "end_hour", "EDC_FEISHU_END_HOUR", 18),
     )
     return AppConfig(
         source=source,
         target=target,
         sync=sync,
         scheduler=scheduler,
+        notification=notification,
         app_host=parser.get("app", "host", fallback="0.0.0.0"),
         app_port=parser.getint("app", "port", fallback=8081),
         debug=parser.getboolean("app", "debug", fallback=False),
     )
+
+
+def _env_or_config(parser: ConfigParser, section: str, option: str, env_name: str) -> str:
+    import os
+
+    value = os.environ.get(env_name)
+    if value is not None:
+        return value.strip()
+    return parser.get(section, option, fallback="").strip()
+
+
+def _env_bool_or_config(parser: ConfigParser, section: str, option: str, env_name: str, fallback: bool) -> bool:
+    import os
+
+    value = os.environ.get(env_name)
+    if value is not None:
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return parser.getboolean(section, option, fallback=fallback)
+
+
+def _env_int_or_config(parser: ConfigParser, section: str, option: str, env_name: str, fallback: int) -> int:
+    import os
+
+    value = os.environ.get(env_name)
+    if value is not None:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    return parser.getint(section, option, fallback=fallback)
 
 
 def _db_config(parser: ConfigParser, section: str, default_table: str) -> DBConfig:

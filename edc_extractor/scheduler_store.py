@@ -221,6 +221,8 @@ class SchedulerStore:
             "rows_read": summary.rows_read,
             "rows_written": summary.rows_written,
             "unmapped_count": summary.unmapped_count,
+            "negative_service_count": summary.negative_service_count,
+            "negative_cache_count": summary.negative_cache_count,
             "duration_ms": summary.duration_ms,
             "chunks": [asdict(chunk) for chunk in summary.chunks],
         }
