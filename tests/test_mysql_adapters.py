@@ -157,6 +157,54 @@ def test_ensure_entity_schema_creates_mapping_table():
     assert any("CREATE TABLE IF NOT EXISTS edc_entities" in query for query in conn.cursor_obj.executed_queries)
 
 
+def test_reconcile_traffic_metadata_updates_only_mapping_snapshot(monkeypatch):
+    conn = FakeMetadataConnection()
+    monkeypatch.setattr(mysql_adapters, "connect", lambda config: conn)
+    monkeypatch.setattr(mysql_adapters, "_ensure_entity_schema", lambda schema_conn: None)
+    target = MySQLEDCTarget(
+        DBConfig(
+            host="localhost",
+            port=3306,
+            user="root",
+            password="",
+            database="nfa",
+        )
+    )
+    progress = []
+
+    summary = target.reconcile_traffic_metadata([7, 3, 7], progress.append)
+
+    assert summary["total_entities"] == 2
+    assert summary["rows_scanned"] == 6
+    assert summary["rows_updated"] == 4
+    assert len(progress) == 2
+    assert conn.commits == 2
+    assert any("NOT (t.cp <=> e.cp)" in query for query in conn.cursor_obj.queries)
+
+
+def test_set_entity_enabled_updates_state_and_writes_audit(monkeypatch):
+    conn = FakeStatusConnection()
+    monkeypatch.setattr(mysql_adapters, "connect", lambda config: conn)
+    monkeypatch.setattr(mysql_adapters, "_ensure_entity_schema", lambda schema_conn: None)
+    monkeypatch.setattr(mysql_adapters, "_ensure_entity_status_audit_schema", lambda schema_conn: None)
+    target = MySQLEDCTarget(
+        DBConfig(
+            host="localhost",
+            port=3306,
+            user="root",
+            password="",
+            database="nfa",
+        )
+    )
+
+    result = target.set_entity_enabled(7, False, operator="web", source_ip="127.0.0.1")
+
+    assert result["enabled"] == 0
+    assert conn.commits == 1
+    assert any("UPDATE edc_entities SET enabled" in query for query in conn.cursor_obj.queries)
+    assert any("INSERT INTO edc_entity_status_audit" in query for query in conn.cursor_obj.queries)
+
+
 class FakeSelectConnection:
     def __init__(self, rows):
         self.rows = rows
@@ -208,6 +256,101 @@ class FakeWriteConnection:
 
     def commit(self):
         self.committed = True
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class FakeMetadataCursor:
+    def __init__(self):
+        self.queries = []
+        self.rowcount = 0
+        self._next = (3,)
+
+    def execute(self, query, params=None):
+        self.queries.append(query)
+        if query.lstrip().upper().startswith("SELECT COUNT"):
+            self._next = (3,)
+        else:
+            self._next = None
+            self.rowcount = 2
+
+    def fetchone(self):
+        return self._next
+
+
+class FakeMetadataConnection:
+    def __init__(self):
+        self.cursor_obj = FakeMetadataCursor()
+        self.commits = 0
+
+    def cursor(self, dictionary=False):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class FakeStatusCursor:
+    def __init__(self):
+        self.queries = []
+        self.rowcount = 0
+        self.entity = {
+            "id": 7,
+            "edc_name": "BJ-ali-01",
+            "sn": "SN1",
+            "display_name": "BJ-ali-01",
+            "alias": None,
+            "region": "北京市",
+            "cp": "阿里",
+            "entity_type": "node",
+            "src_region": None,
+            "dst_region": None,
+            "is_backup": 0,
+            "enabled": 1,
+            "remark": "",
+            "created_at": None,
+            "updated_at": None,
+        }
+        self._next = None
+
+    def execute(self, query, params=None):
+        self.queries.append(query)
+        normalized = query.lstrip().upper()
+        self.rowcount = 0
+        if "FOR UPDATE" in normalized:
+            self._next = dict(self.entity)
+        elif normalized.startswith("UPDATE EDC_ENTITIES"):
+            self.entity["enabled"] = params[0]
+            self.rowcount = 1
+        elif normalized.startswith("INSERT INTO EDC_ENTITY_STATUS_AUDIT"):
+            self.rowcount = 1
+        elif normalized.startswith("SELECT ID"):
+            self._next = dict(self.entity)
+
+    def fetchone(self):
+        return self._next
+
+
+class FakeStatusConnection:
+    def __init__(self):
+        self.cursor_obj = FakeStatusCursor()
+        self.commits = 0
+
+    def cursor(self, dictionary=False):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commits += 1
 
     def rollback(self):
         return None

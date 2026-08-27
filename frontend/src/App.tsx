@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import {
   discoverEntities,
+  ConfiguredEntity,
   EntityPayload,
   EntityType,
   Execution,
@@ -27,6 +28,7 @@ import {
   getTasks,
   getExecutions,
   getHealth,
+  getConfiguredEntities,
   getOnboarding,
   Health,
   OnboardingState,
@@ -34,6 +36,7 @@ import {
   runSync,
   saveEntity,
   saveEntities,
+  setEntityEnabled,
   ScheduledTask,
   SourceEntity,
   SyncResult,
@@ -41,9 +44,11 @@ import {
 } from "./api";
 
 type Notice = { tone: "ok" | "error" | "info"; text: string } | null;
-type ViewKey = "状态" | "EDC发现" | "映射录入" | "同步任务" | "执行记录";
+type ViewKey = "状态" | "EDC发现" | "映射录入" | "实体状态" | "同步任务" | "执行记录";
 type RangeSelectMode = "start" | "end";
 type SseState = "connecting" | "connected" | "fallback";
+type DiscoverySortKey = "edc_name" | "sn" | "latest_create_time" | "record_count" | "configured" | "enabled";
+type DiscoveryStatusFilter = "all" | "enabled" | "disabled";
 
 type SseLease = {
   owner: string;
@@ -66,6 +71,7 @@ const navItems: Array<{ label: ViewKey; icon: typeof Activity }> = [
   { label: "状态", icon: Activity },
   { label: "EDC发现", icon: Search },
   { label: "映射录入", icon: ShieldCheck },
+  { label: "实体状态", icon: Power },
   { label: "同步任务", icon: Play },
   { label: "执行记录", icon: FileClock }
 ];
@@ -208,12 +214,37 @@ function formatNextRun(value: string) {
   return value.replace("T", " ").slice(0, 19);
 }
 
+function compareDiscoveryEntities(left: SourceEntity, right: SourceEntity, key: DiscoverySortKey) {
+  if (key === "record_count") {
+    return left.record_count - right.record_count;
+  }
+  if (key === "configured" || key === "enabled") {
+    const leftValue = key === "configured" ? Number(left.configured) : Number(left.enabled ?? false);
+    const rightValue = key === "configured" ? Number(right.configured) : Number(right.enabled ?? false);
+    return leftValue - rightValue;
+  }
+  const leftValue = String(left[key] ?? "").toLocaleLowerCase();
+  const rightValue = String(right[key] ?? "").toLocaleLowerCase();
+  return leftValue.localeCompare(rightValue, "zh-CN", { numeric: true, sensitivity: "base" });
+}
+
 export function App() {
   const initialRange = useMemo(defaultRange, []);
   const [health, setHealth] = useState<Health | null>(null);
   const [onboarding, setOnboarding] = useState<OnboardingState>({ items: [], counts: {} });
   const [executions, setExecutions] = useState<Execution[]>([]);
   const [entities, setEntities] = useState<SourceEntity[]>([]);
+  const [configuredEntities, setConfiguredEntities] = useState<ConfiguredEntity[]>([]);
+  const [entityStatusFilter, setEntityStatusFilter] = useState<"all" | "enabled" | "disabled">("all");
+  const [entityStatusSearch, setEntityStatusSearch] = useState("");
+  const [statusPendingIds, setStatusPendingIds] = useState<Set<number>>(() => new Set());
+  const [discoverySearch, setDiscoverySearch] = useState("");
+  const [discoveryStatusFilter, setDiscoveryStatusFilter] = useState<DiscoveryStatusFilter>("all");
+  const [discoverySort, setDiscoverySort] = useState<{ key: DiscoverySortKey; direction: "asc" | "desc" }>({
+    key: "latest_create_time",
+    direction: "desc"
+  });
+  const [duplicateNameFilter, setDuplicateNameFilter] = useState<string | null>(null);
   const [selected, setSelected] = useState<SourceEntity | null>(null);
   const [form, setForm] = useState<EntityPayload | null>(null);
   const [range, setRange] = useState(initialRange);
@@ -224,7 +255,7 @@ export function App() {
   const [syncPickerOpen, setSyncPickerOpen] = useState(false);
   const [limit, setLimit] = useState(200);
   const [onlyUnconfigured, setOnlyUnconfigured] = useState(true);
-  const [loading, setLoading] = useState({ health: false, entities: false, save: false, sync: false });
+  const [loading, setLoading] = useState({ health: false, entities: false, save: false, sync: false, configured: false });
   const [notice, setNotice] = useState<Notice>(null);
   const [lastSync, setLastSync] = useState<SyncResult | null>(null);
   const [activeExecutionId, setActiveExecutionId] = useState<number | null>(null);
@@ -268,9 +299,27 @@ export function App() {
     }
   }, [taskDirty]);
 
+  const loadConfiguredEntities = useCallback(async () => {
+    setLoading((current) => ({ ...current, configured: true }));
+    try {
+      const response = await getConfiguredEntities();
+      setConfiguredEntities(response.items);
+    } catch (error) {
+      setNotice({ tone: "error", text: error instanceof Error ? error.message : "实体状态加载失败" });
+    } finally {
+      setLoading((current) => ({ ...current, configured: false }));
+    }
+  }, []);
+
   const refreshOperationalState = useCallback(async () => {
-    await Promise.all([loadHealth(), loadExecutions(), loadTasks(), getOnboarding().then(setOnboarding).catch(() => undefined)]);
-  }, [loadExecutions, loadHealth, loadTasks]);
+    await Promise.all([
+      loadHealth(),
+      loadExecutions(),
+      loadTasks(),
+      loadConfiguredEntities(),
+      getOnboarding().then(setOnboarding).catch(() => undefined)
+    ]);
+  }, [loadConfiguredEntities, loadExecutions, loadHealth, loadTasks]);
 
   const applyTasks = useCallback((items: ScheduledTask[]) => {
     const nextTask = items[0] || null;
@@ -326,14 +375,14 @@ export function App() {
     }
   }, [applyExecutions, applyTasks]);
 
-  const loadEntities = useCallback(async () => {
+  const loadEntities = useCallback(async (onlyUnconfiguredOverride = onlyUnconfigured) => {
     setLoading((current) => ({ ...current, entities: true }));
     try {
       const response = await discoverEntities({
         startTime: toApiTime(range.start),
         endTime: toApiTime(range.end),
         limit,
-        onlyUnconfigured
+        onlyUnconfigured: onlyUnconfiguredOverride
       });
       setEntities(response.items);
       const nextSelected = response.items[0] || null;
@@ -344,9 +393,9 @@ export function App() {
       setNotice({
         tone: "ok",
         text:
-          response.items.length === 0 && onlyUnconfigured
+          response.items.length === 0 && onlyUnconfiguredOverride
             ? "未发现新的未配置 EDC，取消勾选“仅未配置”可查看全部已配置项"
-            : onlyUnconfigured
+            : onlyUnconfiguredOverride
               ? `已发现 ${response.items.length} 条未配置 EDC 名称`
               : `已发现 ${response.items.length} 条 EDC 名称，其中 ${unconfiguredCount} 条未配置`,
       });
@@ -520,7 +569,26 @@ export function App() {
   const configuredCount = entities.filter((item) => item.configured).length;
   const backupCount = entities.filter((item) => item.is_backup).length;
   const unconfiguredCount = entities.length - configuredCount;
-  const selectableEntities = entities.filter((item) => !item.configured);
+  const filteredEntities = useMemo(() => {
+    const keyword = discoverySearch.trim().toLocaleLowerCase();
+    const rows = entities.filter((item) => {
+      if (discoveryStatusFilter === "enabled" && (!item.configured || !item.enabled)) return false;
+      if (discoveryStatusFilter === "disabled" && (!item.configured || item.enabled !== false)) return false;
+      if (duplicateNameFilter && item.edc_name !== duplicateNameFilter) return false;
+      if (!keyword) return true;
+      return [item.edc_name, item.sn, item.display_name || "", item.alias || ""]
+        .some((value) => value.toLocaleLowerCase().includes(keyword));
+    });
+    return rows
+      .map((item, index) => ({ item, index }))
+      .sort((left, right) => {
+        const result = compareDiscoveryEntities(left.item, right.item, discoverySort.key);
+        if (result !== 0) return discoverySort.direction === "asc" ? result : -result;
+        return left.index - right.index;
+      })
+      .map(({ item }) => item);
+  }, [discoverySearch, discoverySort, discoveryStatusFilter, duplicateNameFilter, entities]);
+  const selectableEntities = filteredEntities.filter((item) => !item.configured);
   const selectedEntities = entities.filter((item) => selectedKeys.has(entityKey(item)));
   const allSelectableChecked =
     selectableEntities.length > 0 && selectableEntities.every((item) => selectedKeys.has(entityKey(item)));
@@ -529,6 +597,28 @@ export function App() {
     setSelected(row);
     setForm(mappingForm(row));
     setNotice(null);
+  }
+
+  function toggleDiscoverySort(key: DiscoverySortKey) {
+    setDiscoverySort((current) =>
+      current.key === key
+        ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+        : { key, direction: key === "record_count" || key === "latest_create_time" ? "desc" : "asc" },
+    );
+  }
+
+  function discoverySortLabel(key: DiscoverySortKey) {
+    if (discoverySort.key !== key) return "";
+    return discoverySort.direction === "asc" ? " ↑" : " ↓";
+  }
+
+  async function filterDuplicateName(name: string) {
+    const nextFilter = duplicateNameFilter === name ? null : name;
+    setDuplicateNameFilter(nextFilter);
+    if (nextFilter && onlyUnconfigured) {
+      setOnlyUnconfigured(false);
+      await loadEntities(false);
+    }
   }
 
   function toggleEntity(row: SourceEntity) {
@@ -563,9 +653,11 @@ export function App() {
       const response = await saveEntity(form);
       setNotice({
         tone: "ok",
-        text: response.backfill_status === "scheduled"
-          ? `已写入映射：${form.edc_name}，历史补录已后台排队`
-          : `已写入映射：${form.edc_name}`
+        text: response.metadata_sync_execution_id
+          ? `已写入映射：${form.edc_name}，历史元数据同步任务 #${response.metadata_sync_execution_id} 已排队`
+          : response.backfill_status === "scheduled"
+            ? `已写入映射：${form.edc_name}，历史补录已后台排队`
+            : `已写入映射：${form.edc_name}`
       });
       await loadEntities();
     } catch (error) {
@@ -586,9 +678,11 @@ export function App() {
       const response = await saveEntities(payload);
       setNotice({
         tone: "ok",
-        text: response.backfill_status === "scheduled"
-          ? `已批量写入 ${response.upserted} 条映射，历史补录已后台排队`
-          : `已批量写入 ${response.upserted} 条映射`
+        text: response.metadata_sync_execution_id
+          ? `已批量写入 ${response.upserted} 条映射，历史元数据同步任务 #${response.metadata_sync_execution_id} 已排队`
+          : response.backfill_status === "scheduled"
+            ? `已批量写入 ${response.upserted} 条映射，历史补录已后台排队`
+            : `已批量写入 ${response.upserted} 条映射`
       });
       setSelectedKeys(new Set());
       await loadEntities();
@@ -596,6 +690,55 @@ export function App() {
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "批量写入失败" });
     } finally {
       setLoading((current) => ({ ...current, save: false }));
+    }
+  }
+
+  const filteredConfiguredEntities = useMemo(() => {
+    const keyword = entityStatusSearch.trim().toLowerCase();
+    return configuredEntities.filter((item) => {
+      if (entityStatusFilter === "enabled" && !item.enabled) return false;
+      if (entityStatusFilter === "disabled" && item.enabled) return false;
+      if (!keyword) return true;
+      return [item.edc_name, item.sn, item.display_name, item.alias || ""]
+        .some((value) => value.toLowerCase().includes(keyword));
+    });
+  }, [configuredEntities, entityStatusFilter, entityStatusSearch]);
+
+  async function handleEntityStatusToggle(entity: ConfiguredEntity | SourceEntity) {
+    const entityId = "id" in entity ? entity.id : entity.entity_id;
+    if (entityId === undefined) return;
+    const nextEnabled = !(entity.enabled ?? false);
+    const action = nextEnabled ? "启用" : "禁用";
+    const impact = nextEnabled
+      ? "恢复该实体的同步，并重新纳入结算平台有效查询范围。"
+      : "停止该实体的同步，并从结算平台有效查询范围隐藏；历史事实不会删除。";
+    if (!window.confirm(`确认${action} ${entity.edc_name}（entity_id=${entityId}，SN=${entity.sn || "-"}）？\n${impact}`)) return;
+    setStatusPendingIds((current) => new Set(current).add(entityId));
+    try {
+      const response = await setEntityEnabled(entityId, nextEnabled);
+      setConfiguredEntities((current) =>
+        current.map((item) => item.id === entityId ? response.item : item),
+      );
+      setEntities((current) => current.map((item) =>
+        item.entity_id === entityId
+          ? { ...item, ...response.item, entity_id: entityId, configured: true }
+          : item,
+      ));
+      setSelected((current) => {
+        if (!current || current.entity_id !== entityId) return current;
+        const updated = { ...current, ...response.item, entity_id: entityId, configured: true };
+        setForm(mappingForm(updated));
+        return updated;
+      });
+      setNotice({ tone: "ok", text: `${entity.edc_name}（${entity.sn || "无SN"}）已${action}` });
+    } catch (error) {
+      setNotice({ tone: "error", text: error instanceof Error ? error.message : "实体状态更新失败" });
+    } finally {
+      setStatusPendingIds((current) => {
+        const next = new Set(current);
+        next.delete(entityId);
+        return next;
+      });
     }
   }
 
@@ -828,6 +971,30 @@ export function App() {
                 />
                 仅未配置
               </label>
+              <label className="discovery-search-field">
+                搜索
+                <input
+                  placeholder="名称、SN、展示名或别名"
+                  value={discoverySearch}
+                  onChange={(event) => setDiscoverySearch(event.target.value)}
+                />
+              </label>
+              <label>
+                状态
+                <select value={discoveryStatusFilter} onChange={(event) => setDiscoveryStatusFilter(event.target.value as DiscoveryStatusFilter)}>
+                  <option value="all">全部</option>
+                  <option value="enabled">仅启用</option>
+                  <option value="disabled">仅禁用</option>
+                </select>
+              </label>
+              {duplicateNameFilter && (
+                <button className="ghost clear-filter" onClick={() => setDuplicateNameFilter(null)} type="button">
+                  重复：{duplicateNameFilter} ×
+                </button>
+              )}
+              <div className="discovery-summary">
+                显示 {filteredEntities.length}/{entities.length}
+              </div>
               <button className="ghost batch-button" onClick={() => void handleBulkSave()} disabled={loading.save || !selectedEntities.length}>
                 {loading.save ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
                 批量写入 {selectedEntities.length}
@@ -847,16 +1014,18 @@ export function App() {
                         type="checkbox"
                       />
                     </th>
-                    <th>EDC名称</th>
-                    <th>SN</th>
-                    <th>主/备</th>
-                    <th>最近时间</th>
-                    <th>记录数</th>
-                    <th>配置状态</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {entities.map((row) => (
+                      <th><button className="sort-button" onClick={() => toggleDiscoverySort("edc_name")} type="button">EDC名称{discoverySortLabel("edc_name")}</button></th>
+                      <th><button className="sort-button" onClick={() => toggleDiscoverySort("sn")} type="button">SN{discoverySortLabel("sn")}</button></th>
+                      <th>主/备</th>
+                      <th><button className="sort-button" onClick={() => toggleDiscoverySort("latest_create_time")} type="button">最近时间{discoverySortLabel("latest_create_time")}</button></th>
+                      <th><button className="sort-button" onClick={() => toggleDiscoverySort("record_count")} type="button">记录数{discoverySortLabel("record_count")}</button></th>
+                      <th>配置状态</th>
+                      <th><button className="sort-button" onClick={() => toggleDiscoverySort("enabled")} type="button">同步状态{discoverySortLabel("enabled")}</button></th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                  {filteredEntities.map((row) => (
                     <tr
                       className={selected?.edc_name === row.edc_name && selected?.sn === row.sn ? "selected" : ""}
                       key={`${row.edc_name}-${row.sn}`}
@@ -872,26 +1041,67 @@ export function App() {
                           type="checkbox"
                         />
                       </td>
-                      <td className="name-cell">{row.edc_name}</td>
+                      <td className="name-cell">
+                        <div className="entity-name-line">
+                          <span>{row.edc_name}</span>
+                          {!!row.duplicate_count && (
+                            <button
+                              aria-label={`筛选重复名称 ${row.edc_name}`}
+                              className="duplicate-badge"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void filterDuplicateName(row.edc_name);
+                              }}
+                              title="点击筛选全部同名条目"
+                              type="button"
+                            >
+                              +{row.duplicate_count}
+                            </button>
+                          )}
+                        </div>
+                      </td>
                       <td>{row.sn || "-"}</td>
                       <td>
                         <span className={row.is_backup ? "tag backup" : "tag primary"}>
                           {row.is_backup ? "备份" : "主"}
                         </span>
                       </td>
-                      <td>{row.latest_create_time}</td>
-                      <td>{row.record_count}</td>
+                      <td>{row.history_only ? "历史（当前窗口无数据）" : row.latest_create_time}</td>
+                      <td>{row.history_only ? "-" : row.record_count}</td>
                       <td>
                         <span className={row.configured ? "state ok" : "state pending"}>
                           {row.configured ? "已配置" : "待录入"}
                         </span>
                       </td>
+                      <td>
+                        {row.configured && row.enabled !== undefined ? (
+                          <span className={row.enabled ? "state ok" : "state pending"}>
+                            {row.enabled ? "已启用" : "已禁用"}
+                          </span>
+                        ) : "-"}
+                      </td>
+                      <td>
+                        {row.configured && row.entity_id !== undefined ? (
+                          <button
+                            className={row.enabled ? "status-action disable" : "status-action enable"}
+                            disabled={statusPendingIds.has(row.entity_id)}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleEntityStatusToggle(row);
+                            }}
+                            type="button"
+                          >
+                            {statusPendingIds.has(row.entity_id) ? <Loader2 className="spin" size={14} /> : <Power size={14} />}
+                            {row.enabled ? "禁用" : "启用"}
+                          </button>
+                        ) : "-"}
+                      </td>
                     </tr>
                   ))}
-                  {!entities.length && (
+                  {!filteredEntities.length && (
                     <tr>
-                      <td className="empty" colSpan={7}>
-                        设置时间范围后点击“发现”，这里会列出源端真实 EDC 名称。
+                      <td className="empty" colSpan={9}>
+                        {entities.length ? "没有匹配当前搜索或筛选条件的条目。" : "设置时间范围后点击“发现”，这里会列出源端真实 EDC 名称。"}
                       </td>
                     </tr>
                   )}
@@ -985,6 +1195,88 @@ export function App() {
             )}
           </aside>
         </section>
+        )}
+
+        {activeView === "实体状态" && (
+          <section className="content-grid inspector-focus">
+            <div className="main-panel">
+              <div className="panel-heading">
+                <div>
+                  <h2>实体状态管理</h2>
+                  <p>enabled 同时控制 extractor 同步和结算平台有效展示；历史事实不会删除。</p>
+                </div>
+                <button className="icon-button" onClick={() => void loadConfiguredEntities()} disabled={loading.configured}>
+                  {loading.configured ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
+                  刷新
+                </button>
+              </div>
+              <div className="toolbar entity-status-toolbar">
+                <label>
+                  搜索
+                  <input
+                    placeholder="名称、SN或展示名"
+                    value={entityStatusSearch}
+                    onChange={(event) => setEntityStatusSearch(event.target.value)}
+                  />
+                </label>
+                <label>
+                  状态
+                  <select value={entityStatusFilter} onChange={(event) => setEntityStatusFilter(event.target.value as typeof entityStatusFilter)}>
+                    <option value="all">全部</option>
+                    <option value="enabled">仅启用</option>
+                    <option value="disabled">仅禁用</option>
+                  </select>
+                </label>
+                <div className="status-summary">
+                  <span>实体 {configuredEntities.length}</span>
+                  <span>启用 {configuredEntities.filter((item) => item.enabled).length}</span>
+                  <span>禁用 {configuredEntities.filter((item) => !item.enabled).length}</span>
+                </div>
+              </div>
+              <div className="table-wrap">
+                <table className="entity-status-table">
+                  <thead>
+                    <tr>
+                      <th>实体ID</th>
+                      <th>EDC名称</th>
+                      <th>SN</th>
+                      <th>主/备</th>
+                      <th>状态</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredConfiguredEntities.map((item) => {
+                      const pending = statusPendingIds.has(item.id);
+                      return (
+                        <tr key={item.id}>
+                          <td>{item.id}</td>
+                          <td className="name-cell">{item.edc_name}</td>
+                          <td>{item.sn || "-"}</td>
+                          <td><span className={item.is_backup ? "tag backup" : "tag primary"}>{item.is_backup ? "备份" : "主"}</span></td>
+                          <td><span className={item.enabled ? "state ok" : "state pending"}>{item.enabled ? "已启用" : "已禁用"}</span></td>
+                          <td>
+                            <button
+                              className={item.enabled ? "status-action disable" : "status-action enable"}
+                              disabled={pending}
+                              onClick={() => void handleEntityStatusToggle(item)}
+                              type="button"
+                            >
+                              {pending ? <Loader2 className="spin" size={14} /> : <Power size={14} />}
+                              {item.enabled ? "禁用" : "启用"}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {!filteredConfiguredEntities.length && (
+                      <tr><td className="empty" colSpan={6}>没有匹配的已配置实体。</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
         )}
 
         {(activeView === "同步任务" || activeView === "执行记录") && (
@@ -1168,7 +1460,7 @@ export function App() {
                 <div className="timeline-item" key={item.id}>
                   <CheckCircle2 className={item.status === "completed" ? "ok-icon" : "warn-icon"} size={16} />
                   <div>
-                    <strong>#{item.id} {item.status}</strong>
+                    <strong>#{item.id} {executionLabel(item)} {item.status}</strong>
                     <span>{item.data_start_time} 至 {item.data_end_time}</span>
                     {item.error_message && <em>{item.error_message}</em>}
                   </div>
@@ -1189,6 +1481,7 @@ export function App() {
 function SyncProgress({ execution }: { execution: Execution }) {
   const progress = parseProgress(execution.progress_info);
   const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+  const isMetadata = progress.kind === "metadata_reconcile";
   const completed = progress.completed_chunks || 0;
   const total = progress.total_chunks || 0;
   return (
@@ -1201,12 +1494,23 @@ function SyncProgress({ execution }: { execution: Execution }) {
         <i style={{ width: `${percent}%` }} />
       </div>
       <div className="progress-grid">
-        <span>分片 {completed}/{total || "-"}</span>
-        <span>读取 {execution.rows_read}</span>
-        <span>写入 {execution.rows_written}</span>
-        <span>未映射 {execution.unmapped_count}</span>
-        <span>服务负值修正 {progress.negative_service_count || 0}</span>
-        <span>回源负值修正 {progress.negative_cache_count || 0}</span>
+        {isMetadata ? (
+          <>
+            <span>实体 {progress.completed_entities || 0}/{progress.total_entities || "-"}</span>
+            <span>扫描 {progress.rows_scanned || 0}</span>
+            <span>更新 {progress.rows_updated || 0}</span>
+            <span>当前实体 {progress.entity_id || "-"}</span>
+          </>
+        ) : (
+          <>
+            <span>分片 {completed}/{total || "-"}</span>
+            <span>读取 {execution.rows_read}</span>
+            <span>写入 {execution.rows_written}</span>
+            <span>未映射 {execution.unmapped_count}</span>
+            <span>服务负值修正 {progress.negative_service_count || 0}</span>
+            <span>回源负值修正 {progress.negative_cache_count || 0}</span>
+          </>
+        )}
       </div>
       {progress.current_start_time && progress.current_end_time && (
         <small>{progress.current_start_time} 至 {progress.current_end_time}</small>
@@ -1214,6 +1518,11 @@ function SyncProgress({ execution }: { execution: Execution }) {
       {execution.error_message && <em>{execution.error_message}</em>}
     </div>
   );
+}
+
+function executionLabel(item: Execution) {
+  const progress = parseProgress(item.progress_info);
+  return progress.kind === "metadata_reconcile" ? "映射元数据同步" : "数据同步";
 }
 
 function parseProgress(value: string | null): ExecutionProgress {

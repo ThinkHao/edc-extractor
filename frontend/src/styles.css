@@ -630,6 +630,73 @@ textarea:focus {
   align-self: end;
 }
 
+.discovery-search-field {
+  min-width: 220px;
+  flex: 1 1 220px;
+}
+
+.toolbar select {
+  height: 34px;
+  min-width: 104px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  background: #ffffff;
+}
+
+.clear-filter {
+  align-self: end;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.discovery-summary {
+  align-self: end;
+  min-height: 34px;
+  padding: 8px 2px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.entity-status-toolbar {
+  align-items: end;
+}
+
+.entity-status-toolbar label:first-child {
+  min-width: 240px;
+}
+
+.entity-status-toolbar select {
+  height: 34px;
+  min-width: 112px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  background: #ffffff;
+}
+
+.status-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  margin-left: auto;
+}
+
+.status-summary span {
+  padding: 6px 9px;
+  border-radius: 7px;
+  color: #53616a;
+  background: #ffffff;
+  font-size: 12px;
+  font-weight: 680;
+}
+
 .check-field input,
 .switch-row input,
 .select-col input {
@@ -672,6 +739,19 @@ th {
   font-weight: 720;
 }
 
+.sort-button {
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
+.sort-button:hover {
+  color: var(--accent-strong);
+}
+
 tbody tr {
   cursor: pointer;
   transition: background 120ms ease;
@@ -685,6 +765,31 @@ tbody tr.selected {
 .name-cell {
   color: #14242b;
   font-weight: 700;
+}
+
+.entity-name-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.duplicate-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 21px;
+  padding: 0 7px;
+  border: 1px solid #e7b95f;
+  border-radius: 999px;
+  color: #80520f;
+  background: #fff4d9;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.duplicate-badge:hover {
+  border-color: #c89432;
+  background: #ffe9b3;
 }
 
 .tag,
@@ -707,6 +812,35 @@ tbody tr.selected {
 .tag.backup {
   color: #80520f;
   background: #fff4d9;
+}
+
+.status-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.status-action.enable {
+  color: var(--accent-strong);
+  background: #edf8f6;
+}
+
+.status-action.disable {
+  color: #80520f;
+  background: #fff8e8;
+}
+
+.status-action:disabled {
+  cursor: wait;
+  opacity: 0.62;
 }
 
 .state.pending {

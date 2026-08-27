@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from time import monotonic
 
 from .scheduler_store import SchedulerStore
 from .sync_engine import SyncEngine
@@ -39,6 +40,37 @@ def run_sync_job(
     except Exception as exc:
         error_message = describe_sync_error(exc, source_host, target_host)
         store.fail_execution(execution_id, error_message)
+
+
+def run_metadata_sync_job(
+    store: SchedulerStore,
+    target,
+    execution_id: int,
+    entity_ids: list[int],
+) -> None:
+    started = monotonic()
+
+    def progress_callback(progress: dict) -> None:
+        payload = dict(progress)
+        payload["duration_ms"] = int((monotonic() - started) * 1000)
+        store.update_progress(
+            execution_id,
+            {
+                "total_chunks": payload.get("total_entities", 0),
+                "completed_chunks": payload.get("completed_entities", 0),
+                "percent": payload.get("percent", 0),
+                "rows_read": payload.get("rows_scanned", 0),
+                "rows_written": payload.get("rows_updated", 0),
+                **payload,
+            },
+        )
+
+    try:
+        summary = target.reconcile_traffic_metadata(entity_ids, progress_callback=progress_callback)
+        summary["duration_ms"] = int((monotonic() - started) * 1000)
+        store.complete_custom_execution(execution_id, summary)
+    except Exception as exc:
+        store.fail_execution(execution_id, f"EDC 历史元数据同步失败：{exc}")
 
 
 def describe_sync_error(exc: Exception, source_host: str, target_host: str) -> str:

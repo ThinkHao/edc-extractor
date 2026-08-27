@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import sleep
 
@@ -15,7 +15,7 @@ from .mysql_adapters import MySQLEDCSource, MySQLEDCTarget
 from .notification import FeishuNotificationClient
 from .onboarding import EDCOnboardingMonitor
 from .scheduler_store import SchedulerStore
-from .sync_jobs import describe_sync_error, run_sync_job
+from .sync_jobs import describe_sync_error, run_metadata_sync_job, run_sync_job
 from .sync_engine import SyncEngine
 from .task_scheduler import EDCTaskScheduler, validate_cron_expression
 
@@ -34,6 +34,7 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="edc-sync")
     onboarding_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="edc-onboarding")
     backfill_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="edc-backfill")
+    metadata_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="edc-metadata")
     notifier = FeishuNotificationClient(config.notification)
     onboarding = EDCOnboardingMonitor(
         source=source,
@@ -194,6 +195,7 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
             limit = _parse_limit(request.args.get("limit"))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        only_unconfigured = _parse_bool(request.args.get("only_unconfigured"), default=False)
         try:
             candidates = source.discover_entity_candidates(start_time, end_time, limit)
             configured_entities = target.load_entity_mappings()
@@ -202,8 +204,11 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
                 upsert_candidates(candidates, configured_keys=set(configured_entities))
         except Exception as exc:
             return jsonify({"error": f"源端 EDC 发现失败: {exc}"}), 500
-        payload = build_entity_payload(candidates, configured_entities)
-        only_unconfigured = _parse_bool(request.args.get("only_unconfigured"), default=False)
+        payload = build_entity_payload(
+            candidates,
+            configured_entities,
+            include_configured_history=not only_unconfigured,
+        )
         if only_unconfigured:
             payload = [item for item in payload if not item["configured"]]
         return jsonify({"items": payload})
@@ -224,6 +229,32 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
             for row in rows
         }
 
+        metadata_execution_id = None
+        try:
+            entity_ids = target.entity_ids_for_keys(entity_keys)
+            if entity_ids:
+                start_time, end_time = target.get_entity_traffic_bounds(entity_ids)
+                now = datetime.now()
+                start_time = start_time or now
+                end_time = end_time or (start_time + timedelta(minutes=5))
+                if end_time <= start_time:
+                    end_time = start_time + timedelta(minutes=5)
+                metadata_execution_id = store.create_execution(
+                    None,
+                    start_time,
+                    end_time,
+                    kind="metadata_reconcile",
+                )
+                metadata_executor.submit(
+                    run_metadata_sync_job,
+                    store,
+                    target,
+                    metadata_execution_id,
+                    entity_ids,
+                )
+        except Exception:
+            app.logger.exception("写入映射后触发历史元数据同步失败")
+
         def schedule_backfill() -> None:
             try:
                 onboarding.process_pending(entity_keys=entity_keys)
@@ -231,7 +262,42 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
                 app.logger.exception("写入映射后触发历史补录失败")
 
         onboarding_executor.submit(schedule_backfill)
-        return jsonify({"upserted": upserted, "backfill_status": "scheduled"}), 202
+        return jsonify(
+            {
+                "upserted": upserted,
+                "backfill_status": "scheduled",
+                "metadata_sync_status": "scheduled" if metadata_execution_id else "not_scheduled",
+                "metadata_sync_execution_id": metadata_execution_id,
+            }
+        ), 202
+
+    @app.get("/api/entities/configured")
+    def configured_entities():
+        try:
+            items = target.list_entity_records()
+            return jsonify({"items": [_serialize_entity(item) for item in items]})
+        except Exception as exc:
+            return jsonify({"error": f"获取实体状态失败: {exc}"}), 500
+
+    @app.patch("/api/entities/<int:entity_id>/enabled")
+    def update_entity_enabled(entity_id: int):
+        payload = request.get_json(silent=True) or {}
+        try:
+            enabled = _parse_strict_bool(payload.get("enabled"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            item = target.set_entity_enabled(
+                entity_id,
+                enabled,
+                operator="web",
+                source_ip=request.remote_addr,
+            )
+            if item is None:
+                return jsonify({"error": "实体不存在"}), 404
+            return jsonify({"item": _serialize_entity(item)})
+        except Exception as exc:
+            return jsonify({"error": f"更新实体状态失败: {exc}"}), 500
 
     @app.post("/api/sync")
     def sync():
@@ -243,6 +309,17 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
         return jsonify({"execution_id": execution_id, "status": "running"}), 202
 
     return app
+
+
+def _disabled_source_names(configured_entities) -> set[str]:
+    """隐藏仅由停用映射覆盖的源端名称，保留同名仍有启用 SN 的实体。"""
+    enabled_names = {
+        key[0] for key, mapping in configured_entities.items() if mapping.enabled
+    }
+    disabled_names = {
+        key[0] for key, mapping in configured_entities.items() if not mapping.enabled
+    }
+    return disabled_names - enabled_names
 
 
 def _parse_time(value) -> datetime:
@@ -280,6 +357,19 @@ def _parse_bool(value, default: bool) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_strict_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("enabled must be a boolean")
 
 
 def _validate_entity_rows(rows: list[dict]) -> None:
@@ -349,6 +439,17 @@ def _serialize_candidate(item: dict) -> dict:
         value = out.get(key)
         if isinstance(value, datetime):
             out[key] = value.isoformat(sep=" ")
+    return out
+
+
+def _serialize_entity(item: dict) -> dict:
+    out = dict(item)
+    for key in ("created_at", "updated_at"):
+        value = out.get(key)
+        if isinstance(value, datetime):
+            out[key] = value.isoformat(sep=" ")
+    out["enabled"] = bool(out.get("enabled"))
+    out["is_backup"] = bool(out.get("is_backup"))
     return out
 
 

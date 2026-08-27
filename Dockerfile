@@ -26,7 +26,9 @@ COPY README.md ./README.md
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 RUN mkdir -p /app/data \
-    && chown -R edc:edc /app
+    && chown -R edc:edc /app \
+    && find /app/frontend/dist -type d -exec chmod 755 {} + \
+    && find /app/frontend/dist -type f -exec chmod 644 {} +
 
 USER edc
 EXPOSE 8081

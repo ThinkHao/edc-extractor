@@ -160,9 +160,17 @@ class SchedulerStore:
             row = conn.execute("SELECT 1 FROM edc_task_executions WHERE status = 'running' LIMIT 1").fetchone()
             return row is not None
 
-    def create_execution(self, task_id: int | None, data_start_time: datetime, data_end_time: datetime) -> int:
+    def create_execution(
+        self,
+        task_id: int | None,
+        data_start_time: datetime,
+        data_end_time: datetime,
+        *,
+        kind: str = "traffic_sync",
+    ) -> int:
         now = datetime.now().isoformat(timespec="seconds")
         progress = {
+            "kind": kind,
             "total_chunks": 0,
             "completed_chunks": 0,
             "percent": 0,
@@ -186,6 +194,35 @@ class SchedulerStore:
                 ),
             )
             return int(cur.lastrowid)
+
+    def complete_custom_execution(self, execution_id: int, progress: dict) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = dict(progress)
+        payload.setdefault("percent", 100)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE edc_task_executions
+                SET status = 'completed',
+                    end_time = ?,
+                    rows_read = ?,
+                    rows_written = ?,
+                    unmapped_count = 0,
+                    duration_ms = ?,
+                    progress_info = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    int(payload.get("rows_scanned") or payload.get("rows_read") or 0),
+                    int(payload.get("rows_updated") or payload.get("rows_written") or 0),
+                    int(payload.get("duration_ms") or 0),
+                    json.dumps(payload, default=str, ensure_ascii=False),
+                    now,
+                    execution_id,
+                ),
+            )
 
     def update_progress(self, execution_id: int, progress: dict) -> None:
         now = datetime.now().isoformat(timespec="seconds")

@@ -22,6 +22,9 @@ export type SourceEntity = {
   record_count: number;
   is_backup: boolean;
   configured: boolean;
+  entity_id?: number;
+  duplicate_count?: number;
+  history_only?: boolean;
   display_name?: string;
   alias?: string | null;
   region?: string;
@@ -46,6 +49,24 @@ export type EntityPayload = {
   is_backup: boolean;
   enabled: boolean;
   remark: string;
+};
+
+export type ConfiguredEntity = {
+  id: number;
+  edc_name: string;
+  sn: string;
+  display_name: string;
+  alias?: string | null;
+  region: string;
+  cp: string;
+  entity_type?: EntityType | null;
+  src_region?: string | null;
+  dst_region?: string | null;
+  is_backup: boolean;
+  enabled: boolean;
+  remark: string;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export type EntityType = "node" | "transmission";
@@ -79,8 +100,14 @@ export type SyncResult = {
 };
 
 export type ExecutionProgress = {
+  kind?: string;
   total_chunks?: number;
   completed_chunks?: number;
+  total_entities?: number;
+  completed_entities?: number;
+  rows_scanned?: number;
+  rows_updated?: number;
+  entity_id?: number;
   percent?: number;
   current_start_time?: string;
   current_end_time?: string;
@@ -192,9 +219,25 @@ export function saveEntity(item: EntityPayload) {
 }
 
 export function saveEntities(items: EntityPayload[]) {
-  return request<{ upserted: number; backfill_status?: string }>("/api/entities", {
+  return request<{
+    upserted: number;
+    backfill_status?: string;
+    metadata_sync_status?: string;
+    metadata_sync_execution_id?: number | null;
+  }>("/api/entities", {
     method: "POST",
     body: JSON.stringify({ items })
+  });
+}
+
+export function getConfiguredEntities() {
+  return request<{ items: ConfiguredEntity[] }>("/api/entities/configured");
+}
+
+export function setEntityEnabled(entityId: number, enabled: boolean) {
+  return request<{ item: ConfiguredEntity }>(`/api/entities/${entityId}/enabled`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled })
   });
 }
 

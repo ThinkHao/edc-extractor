@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from time import sleep
-from typing import Iterable
+from typing import Callable, Iterable
 
 import mysql.connector
 
@@ -226,6 +226,93 @@ class MySQLEDCTarget:
     def load_entity_keys(self) -> set[tuple[str, str]]:
         return set(self.load_entity_mappings())
 
+    def list_entity_records(self) -> list[dict]:
+        """返回全部已配置实体，包含已禁用实体，供状态管理页面使用。"""
+        conn = connect(self.config)
+        try:
+            _ensure_entity_schema(conn)
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT id, edc_name, sn, display_name, alias, region, cp, entity_type,
+                       src_region, dst_region, is_backup, enabled, remark, created_at, updated_at
+                FROM edc_entities
+                ORDER BY enabled DESC, is_backup ASC, edc_name ASC, sn ASC, id ASC
+                """
+            )
+            return [dict(row) for row in cursor]
+        finally:
+            conn.close()
+
+    def set_entity_enabled(
+        self,
+        entity_id: int,
+        enabled: bool,
+        *,
+        operator: str = "web",
+        source_ip: str | None = None,
+    ) -> dict | None:
+        """幂等切换实体状态，并在同一事务中记录审计。"""
+        conn = connect(self.config)
+        try:
+            _ensure_entity_schema(conn)
+            _ensure_entity_status_audit_schema(conn)
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT id, edc_name, sn, display_name, alias, region, cp, entity_type,
+                       src_region, dst_region, is_backup, enabled, remark, created_at, updated_at
+                FROM edc_entities
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (int(entity_id),),
+            )
+            before = cursor.fetchone()
+            if not before:
+                conn.rollback()
+                return None
+            before_enabled = bool(before.get("enabled"))
+            after_enabled = bool(enabled)
+            if before_enabled != after_enabled:
+                cursor.execute(
+                    "UPDATE edc_entities SET enabled = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                    (1 if after_enabled else 0, int(entity_id)),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO edc_entity_status_audit
+                      (entity_id, edc_name, sn, enabled_before, enabled_after, operator, source_ip)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        int(entity_id),
+                        str(before["edc_name"]),
+                        str(before.get("sn") or ""),
+                        1 if before_enabled else 0,
+                        1 if after_enabled else 0,
+                        _audit_text(operator, "web"),
+                        _audit_text(source_ip, None),
+                    ),
+                )
+            conn.commit()
+            cursor.execute(
+                """
+                SELECT id, edc_name, sn, display_name, alias, region, cp, entity_type,
+                       src_region, dst_region, is_backup, enabled, remark, created_at, updated_at
+                FROM edc_entities
+                WHERE id = %s
+                """,
+                (int(entity_id),),
+            )
+            result = cursor.fetchone()
+            return dict(result) if result else None
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def load_entity_mappings(self) -> dict[tuple[str, str], ConfiguredEntityMapping]:
         conn = connect(self.config)
         try:
@@ -233,7 +320,7 @@ class MySQLEDCTarget:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
                 """
-                SELECT edc_name, sn, display_name, alias, region, cp, entity_type, src_region, dst_region,
+                SELECT id, edc_name, sn, display_name, alias, region, cp, entity_type, src_region, dst_region,
                        is_backup, enabled, remark
                 FROM edc_entities
                 """
@@ -252,6 +339,7 @@ class MySQLEDCTarget:
                     is_backup=bool(row.get("is_backup")),
                     enabled=bool(row.get("enabled")),
                     remark=str(row.get("remark") or ""),
+                    entity_id=int(row["id"]) if row.get("id") is not None else None,
                 )
                 for row in cursor
             }
@@ -304,6 +392,125 @@ class MySQLEDCTarget:
             )
             conn.commit()
             return len(payload)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def entity_ids_for_keys(self, entity_keys: set[tuple[str, str]]) -> list[int]:
+        if not entity_keys:
+            return []
+        conn = connect(self.config)
+        try:
+            cursor = conn.cursor()
+            conditions = []
+            params: list[str] = []
+            for edc_name, sn in sorted(entity_keys):
+                conditions.append("(edc_name = %s AND sn = %s)")
+                params.extend((edc_name, sn or ""))
+            cursor.execute(
+                "SELECT id FROM edc_entities WHERE " + " OR ".join(conditions) + " ORDER BY id",
+                params,
+            )
+            return [int(row[0]) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_entity_traffic_bounds(self, entity_ids: list[int]) -> tuple[datetime | None, datetime | None]:
+        if not entity_ids:
+            return None, None
+        conn = connect(self.config)
+        try:
+            cursor = conn.cursor()
+            placeholders = ",".join(["%s"] * len(entity_ids))
+            cursor.execute(
+                f"SELECT MIN(bucket_5m), MAX(bucket_5m) FROM edc_traffic_5m WHERE entity_id IN ({placeholders})",
+                entity_ids,
+            )
+            row = cursor.fetchone() or (None, None)
+            return row[0], row[1]
+        finally:
+            conn.close()
+
+    def reconcile_traffic_metadata(
+        self,
+        entity_ids: list[int],
+        progress_callback: Callable[[dict], None] | None = None,
+    ) -> dict:
+        """把历史流量行的映射快照幂等同步为当前实体映射，不改流量数值。"""
+        unique_ids = sorted({int(entity_id) for entity_id in entity_ids})
+        if not unique_ids:
+            return {
+                "kind": "metadata_reconcile",
+                "total_entities": 0,
+                "completed_entities": 0,
+                "rows_scanned": 0,
+                "rows_updated": 0,
+                "percent": 100,
+            }
+        conn = connect(self.config)
+        try:
+            _ensure_entity_schema(conn)
+            cursor = conn.cursor()
+            rows_scanned = 0
+            rows_updated = 0
+            for completed, entity_id in enumerate(unique_ids, 1):
+                cursor.execute(
+                    "SELECT COUNT(*) FROM edc_traffic_5m WHERE entity_id = %s",
+                    (entity_id,),
+                )
+                row = cursor.fetchone() or (0,)
+                entity_rows = int(row[0] or 0)
+                rows_scanned += entity_rows
+                cursor.execute(
+                    """
+                    UPDATE edc_traffic_5m AS t
+                    INNER JOIN edc_entities AS e ON e.id = t.entity_id
+                    SET t.region = e.region,
+                        t.cp = e.cp,
+                        t.entity_type = e.entity_type,
+                        t.src_region = e.src_region,
+                        t.dst_region = e.dst_region,
+                        t.alias = e.alias,
+                        t.display_name = e.display_name,
+                        t.updated_at = CURRENT_TIMESTAMP
+                    WHERE t.entity_id = %s
+                      AND (
+                        NOT (t.region <=> e.region)
+                        OR NOT (t.cp <=> e.cp)
+                        OR NOT (t.entity_type <=> e.entity_type)
+                        OR NOT (t.src_region <=> e.src_region)
+                        OR NOT (t.dst_region <=> e.dst_region)
+                        OR NOT (t.alias <=> e.alias)
+                        OR NOT (t.display_name <=> e.display_name)
+                      )
+                    """,
+                    (entity_id,),
+                )
+                changed = int(cursor.rowcount or 0)
+                rows_updated += changed
+                conn.commit()
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "kind": "metadata_reconcile",
+                            "total_entities": len(unique_ids),
+                            "completed_entities": completed,
+                            "percent": int(completed * 100 / len(unique_ids)),
+                            "entity_id": entity_id,
+                            "rows_scanned": rows_scanned,
+                            "rows_updated": rows_updated,
+                        }
+                    )
+            return {
+                "kind": "metadata_reconcile",
+                "total_entities": len(unique_ids),
+                "completed_entities": len(unique_ids),
+                "rows_scanned": rows_scanned,
+                "rows_updated": rows_updated,
+                "percent": 100,
+            }
         except Exception:
             conn.rollback()
             raise
@@ -628,6 +835,34 @@ def _ensure_entity_schema(conn) -> None:
     if not row or int(row[0]) == 0:
         cursor.execute("CREATE INDEX idx_edc_entities_backup_enabled ON edc_entities (is_backup, enabled)")
         conn.commit()
+
+
+def _ensure_entity_status_audit_schema(conn) -> None:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS edc_entity_status_audit (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          entity_id BIGINT NOT NULL,
+          edc_name VARCHAR(255) NOT NULL,
+          sn VARCHAR(255) NOT NULL DEFAULT '',
+          enabled_before TINYINT(1) NOT NULL,
+          enabled_after TINYINT(1) NOT NULL,
+          operator VARCHAR(128) NOT NULL DEFAULT 'web',
+          source_ip VARCHAR(64) NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          KEY idx_edc_entity_status_audit_entity_time (entity_id, created_at)
+        )
+        """
+    )
+    conn.commit()
+
+
+def _audit_text(value, default: str | None) -> str | None:
+    if value is None:
+        return default
+    normalized = str(value).strip()
+    return normalized or default
 
 
 def _upsert_traffic_rows(conn, rows: list[dict], entity_map: dict[int, EDCEntity]) -> int:
