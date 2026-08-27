@@ -579,6 +579,8 @@ class MySQLEDCTarget:
                 values = sorted(statuses)
                 where = " WHERE status IN (" + ",".join(["%s"] * len(values)) + ")"
                 params.extend(values)
+                if statuses.issubset({"pending", "failed"}):
+                    where += " AND enabled = 1"
             if entity_keys:
                 key_conditions = []
                 for edc_name, sn in sorted(entity_keys):
@@ -590,6 +592,98 @@ class MySQLEDCTarget:
                 [*params, max(1, min(int(limit), 5000))],
             )
             return [dict(row) for row in cursor]
+        finally:
+            conn.close()
+
+    def list_entity_candidate_states(
+        self,
+        entity_keys: set[tuple[str, str]],
+    ) -> dict[tuple[str, str], dict]:
+        """返回发现页候选条目的持久化状态，供待录入行显示和操作。"""
+        rows = self.list_entity_candidates(
+            limit=max(1, len(entity_keys)),
+            entity_keys=entity_keys,
+        )
+        return {
+            (str(row["edc_name"]), str(row.get("sn") or "")): dict(row)
+            for row in rows
+        }
+
+    def set_entity_candidate_enabled(
+        self,
+        candidate_id: int,
+        enabled: bool,
+        *,
+        operator: str = "web",
+        source_ip: str | None = None,
+    ) -> dict | None:
+        """幂等切换待录入候选条目状态，并记录审计。"""
+        conn = connect(self.config)
+        try:
+            _ensure_candidate_schema_for_config(self.config)
+            _ensure_candidate_status_audit_schema(conn)
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT id, edc_name, sn, enabled, status, entity_id
+                FROM edc_entity_candidates
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (int(candidate_id),),
+            )
+            before = cursor.fetchone()
+            if not before:
+                conn.rollback()
+                return None
+            if before.get("entity_id") is not None or str(before.get("status") or "") not in {
+                "pending",
+                "failed",
+                "disabled",
+            }:
+                raise ValueError("该候选条目已进入映射或补录流程，不能在待录入状态下切换")
+
+            before_enabled = bool(before.get("enabled", 1))
+            after_enabled = bool(enabled)
+            if before_enabled != after_enabled:
+                next_status = "pending" if after_enabled and before.get("status") == "disabled" else (
+                    "disabled" if not after_enabled else str(before.get("status") or "pending")
+                )
+                cursor.execute(
+                    "UPDATE edc_entity_candidates SET enabled = %s, status = %s, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                    (1 if after_enabled else 0, next_status, int(candidate_id)),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO edc_entity_candidate_status_audit
+                      (candidate_id, edc_name, sn, enabled_before, enabled_after, operator, source_ip)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        int(candidate_id),
+                        str(before["edc_name"]),
+                        str(before.get("sn") or ""),
+                        1 if before_enabled else 0,
+                        1 if after_enabled else 0,
+                        _audit_text(operator, "web"),
+                        _audit_text(source_ip, None),
+                    ),
+                )
+            conn.commit()
+            cursor.execute(
+                """
+                SELECT id, edc_name, sn, enabled, status, entity_id, updated_at
+                FROM edc_entity_candidates
+                WHERE id = %s
+                """,
+                (int(candidate_id),),
+            )
+            result = cursor.fetchone()
+            return dict(result) if result else None
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -610,7 +704,7 @@ class MySQLEDCTarget:
                 SET status = 'backfill_pending', entity_id = %s, backfill_start_at = %s,
                     backfill_end_at = %s, backfill_error = NULL, confirmed_at = COALESCE(confirmed_at, CURRENT_TIMESTAMP),
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s AND status IN ('pending', 'failed')
+                WHERE id = %s AND status IN ('pending', 'failed') AND enabled = 1
                 """,
                 (entity_id, start_time, end_time, candidate_id),
             )
@@ -653,7 +747,7 @@ class MySQLEDCTarget:
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE edc_entity_candidates SET status = 'pending', backfill_error = NULL, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = %s AND status = 'failed'",
+                "updated_at = CURRENT_TIMESTAMP WHERE id = %s AND status = 'failed' AND enabled = 1",
                 (candidate_id,),
             )
             conn.commit()
@@ -998,6 +1092,7 @@ def _ensure_candidate_schema_for_config(config: DBConfig) -> None:
               first_seen_at DATETIME NULL,
               latest_seen_at DATETIME NULL,
               record_count BIGINT NOT NULL DEFAULT 0,
+              enabled TINYINT(1) NOT NULL DEFAULT 1,
               status VARCHAR(32) NOT NULL DEFAULT 'pending',
               last_notified_level TINYINT NOT NULL DEFAULT 0,
               last_notified_at DATETIME NULL,
@@ -1032,5 +1127,41 @@ def _ensure_candidate_schema_for_config(config: DBConfig) -> None:
                 "UPDATE edc_entity_candidates SET is_backup = CASE WHEN LOWER(edc_name) LIKE '%backup%' THEN 1 ELSE 0 END"
             )
             conn.commit()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'edc_entity_candidates'
+              AND COLUMN_NAME = 'enabled'
+            """
+        )
+        row = cursor.fetchone()
+        if not row or int(row[0]) == 0:
+            cursor.execute(
+                "ALTER TABLE edc_entity_candidates ADD COLUMN enabled TINYINT(1) NOT NULL DEFAULT 1 AFTER record_count"
+            )
+            conn.commit()
     finally:
         conn.close()
+
+
+def _ensure_candidate_status_audit_schema(conn) -> None:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS edc_entity_candidate_status_audit (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          candidate_id BIGINT NOT NULL,
+          edc_name VARCHAR(255) NOT NULL,
+          sn VARCHAR(255) NOT NULL DEFAULT '',
+          enabled_before TINYINT(1) NOT NULL,
+          enabled_after TINYINT(1) NOT NULL,
+          operator VARCHAR(128) NOT NULL DEFAULT 'web',
+          source_ip VARCHAR(64) NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          KEY idx_edc_entity_candidate_status_audit_candidate_time (candidate_id, created_at)
+        )
+        """
+    )
+    conn.commit()

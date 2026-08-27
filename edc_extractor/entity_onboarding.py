@@ -43,6 +43,7 @@ def build_entity_payload(
     configured_entities: Mapping[tuple[str, str], ConfiguredEntityMapping],
     *,
     include_configured_history: bool = False,
+    candidate_states: Mapping[tuple[str, str], Mapping[str, object]] | None = None,
 ) -> list[dict]:
     keys_by_name: dict[str, set[tuple[str, str]]] = {}
     for key in configured_entities:
@@ -81,6 +82,14 @@ def build_entity_payload(
             )
             if configured.entity_id is not None:
                 item["entity_id"] = configured.entity_id
+        else:
+            state = (candidate_states or {}).get(key)
+            if state:
+                if state.get("id") is not None:
+                    item["candidate_id"] = int(state["id"])
+                item["enabled"] = bool(state.get("enabled", True))
+                if state.get("status") is not None:
+                    item["candidate_status"] = str(state["status"])
         payload.append(item)
 
     if include_configured_history:

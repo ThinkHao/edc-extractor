@@ -98,7 +98,7 @@ npm run dev
 
 - 健康状态查看。
 - 按时间窗口发现源端 EDC 名称。
-- EDC 发现页支持名称/SN 搜索、表头排序、同名重复徽标筛选，以及对已配置条目启用/禁用；禁用只停止后续同步，不删除历史事实。
+- EDC 发现页支持名称/SN 搜索、表头排序、同名重复徽标筛选，以及对已配置和待录入条目启用/禁用；待录入条目禁用后停止提醒、映射选择和历史补录，不删除源端数据。
 - 标识 `backup` 备份数据。
 - 对未配置项确认并写入 `edc_entities`，主备状态会写入 `is_backup` 字段。
 - 手动触发同步、配置自动同步并查看执行记录。
@@ -136,6 +136,8 @@ EDC_FEISHU_END_HOUR=18
 ```
 
 也可以配置 `EDC_FEISHU_WEBHOOK_URL` 使用群自定义机器人。录入状态通过 `GET /api/onboarding` 查询；补录失败后可调用 `POST /api/onboarding/<candidate_id>/retry` 重试。
+
+待录入条目的启停通过 `PATCH /api/entity-candidates/<candidate_id>/enabled` 管理；禁用候选会标记为 `disabled`，重新启用后恢复为待录入状态。
 
 `config.ini`、`.env`、前端依赖、构建产物和运行态数据库已在 `.gitignore` 中忽略，不要提交真实数据库密码。
 

@@ -202,12 +202,19 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
             upsert_candidates = getattr(target, "upsert_entity_candidates", None)
             if callable(upsert_candidates):
                 upsert_candidates(candidates, configured_keys=set(configured_entities))
+            candidate_states = {}
+            state_reader = getattr(target, "list_entity_candidate_states", None)
+            if callable(state_reader) and candidates:
+                candidate_states = state_reader(
+                    {(candidate.edc_name, candidate.sn or "") for candidate in candidates}
+                )
         except Exception as exc:
             return jsonify({"error": f"源端 EDC 发现失败: {exc}"}), 500
         payload = build_entity_payload(
             candidates,
             configured_entities,
             include_configured_history=not only_unconfigured,
+            candidate_states=candidate_states,
         )
         if only_unconfigured:
             payload = [item for item in payload if not item["configured"]]
@@ -298,6 +305,31 @@ def create_app(config_path: str | None = None, start_scheduler: bool | None = No
             return jsonify({"item": _serialize_entity(item)})
         except Exception as exc:
             return jsonify({"error": f"更新实体状态失败: {exc}"}), 500
+
+    @app.patch("/api/entity-candidates/<int:candidate_id>/enabled")
+    def update_entity_candidate_enabled(candidate_id: int):
+        payload = request.get_json(silent=True) or {}
+        try:
+            enabled = _parse_strict_bool(payload.get("enabled"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        set_candidate_enabled = getattr(target, "set_entity_candidate_enabled", None)
+        if not callable(set_candidate_enabled):
+            return jsonify({"error": "当前目标库不支持待录入条目状态管理"}), 501
+        try:
+            item = set_candidate_enabled(
+                candidate_id,
+                enabled,
+                operator="web",
+                source_ip=request.remote_addr,
+            )
+            if item is None:
+                return jsonify({"error": "待录入条目不存在"}), 404
+            return jsonify({"item": _serialize_candidate(item)})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:
+            return jsonify({"error": f"更新待录入条目状态失败: {exc}"}), 500
 
     @app.post("/api/sync")
     def sync():
@@ -439,6 +471,7 @@ def _serialize_candidate(item: dict) -> dict:
         value = out.get(key)
         if isinstance(value, datetime):
             out[key] = value.isoformat(sep=" ")
+    out["enabled"] = bool(out.get("enabled", True))
     return out
 
 

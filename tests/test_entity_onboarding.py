@@ -117,3 +117,24 @@ def test_build_entity_payload_counts_same_name_entries_across_history_and_discov
     assert len(history_payload) == 3
     assert history_payload[-1]["history_only"] is True
     assert history_payload[-1]["latest_create_time"] == "-"
+
+
+def test_build_entity_payload_includes_candidate_state_for_unconfigured_rows():
+    candidate = SourceEntityCandidate(
+        edc_name="BJ-ali-01",
+        sn="NEW-SN",
+        latest_create_time=datetime(2026, 5, 26, 10, 0, 0),
+        record_count=12,
+    )
+
+    payload = build_entity_payload(
+        [candidate],
+        {},
+        candidate_states={
+            ("BJ-ali-01", "NEW-SN"): {"id": 9, "enabled": 0, "status": "disabled"}
+        },
+    )
+
+    assert payload[0]["candidate_id"] == 9
+    assert payload[0]["enabled"] is False
+    assert payload[0]["candidate_status"] == "disabled"

@@ -23,6 +23,8 @@ export type SourceEntity = {
   is_backup: boolean;
   configured: boolean;
   entity_id?: number;
+  candidate_id?: number;
+  candidate_status?: string;
   duplicate_count?: number;
   history_only?: boolean;
   display_name?: string;
@@ -135,6 +137,7 @@ export type OnboardingCandidate = {
   edc_name: string;
   sn: string;
   status: string;
+  enabled?: boolean;
   first_seen_at: string | null;
   latest_seen_at: string | null;
   backfill_error: string | null;
@@ -236,6 +239,13 @@ export function getConfiguredEntities() {
 
 export function setEntityEnabled(entityId: number, enabled: boolean) {
   return request<{ item: ConfiguredEntity }>(`/api/entities/${entityId}/enabled`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled })
+  });
+}
+
+export function setEntityCandidateEnabled(candidateId: number, enabled: boolean) {
+  return request<{ item: OnboardingCandidate }>(`/api/entity-candidates/${candidateId}/enabled`, {
     method: "PATCH",
     body: JSON.stringify({ enabled })
   });

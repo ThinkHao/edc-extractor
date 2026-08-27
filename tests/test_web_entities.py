@@ -194,6 +194,49 @@ class StatusTarget:
         return None
 
 
+class CandidateSource:
+    def __init__(self, config):
+        self.config = config
+
+    def discover_entity_candidates(self, start_time, end_time, limit):
+        return [
+            SourceEntityCandidate(
+                edc_name="BJ-ali-01",
+                sn="NEW-SN",
+                latest_create_time=datetime(2026, 6, 3, 16, 45, 0),
+                record_count=12,
+            )
+        ]
+
+
+class CandidateTarget:
+    def __init__(self, config):
+        self.config = config
+        self.candidate = {
+            "id": 9,
+            "edc_name": "BJ-ali-01",
+            "sn": "NEW-SN",
+            "enabled": False,
+            "status": "disabled",
+        }
+
+    def load_entity_mappings(self):
+        return {}
+
+    def upsert_entity_candidates(self, candidates, configured_keys=None):
+        return len(candidates)
+
+    def list_entity_candidate_states(self, entity_keys):
+        return {("BJ-ali-01", "NEW-SN"): self.candidate}
+
+    def set_entity_candidate_enabled(self, candidate_id, enabled, *, operator, source_ip):
+        if candidate_id != self.candidate["id"]:
+            return None
+        self.candidate["enabled"] = enabled
+        self.candidate["status"] = "pending" if enabled else "disabled"
+        return self.candidate
+
+
 def test_source_entities_returns_json_when_discovery_fails(tmp_path, monkeypatch):
     config_path = tmp_path / "config.ini"
     write_config(config_path)
@@ -335,3 +378,28 @@ def test_update_entity_enabled_validates_and_updates(tmp_path, monkeypatch):
     assert response.get_json()["item"]["enabled"] is True
     assert invalid.status_code == 400
     assert missing.status_code == 404
+
+
+def test_source_entities_includes_candidate_state_and_candidate_toggle(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.ini"
+    write_config(config_path)
+    monkeypatch.setenv("EDC_SCHEDULER_DB", str(tmp_path / "scheduler.db"))
+    monkeypatch.setattr(web_module, "MySQLEDCSource", CandidateSource)
+    monkeypatch.setattr(web_module, "MySQLEDCTarget", CandidateTarget)
+
+    app = web_module.create_app(config_path, start_scheduler=False)
+    client = app.test_client()
+    response = client.get(
+        "/api/source/entities?start_time=2026-06-01%2000:00:00&end_time=2026-06-01%2001:00:00&limit=10"
+    )
+    item = response.get_json()["items"][0]
+    toggled = client.patch("/api/entity-candidates/9/enabled", json={"enabled": True})
+
+    assert response.status_code == 200
+    assert item["configured"] is False
+    assert item["candidate_id"] == 9
+    assert item["enabled"] is False
+    assert item["candidate_status"] == "disabled"
+    assert toggled.status_code == 200
+    assert toggled.get_json()["item"]["enabled"] is True
+    assert toggled.get_json()["item"]["status"] == "pending"

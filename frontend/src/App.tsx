@@ -36,6 +36,7 @@ import {
   runSync,
   saveEntity,
   saveEntities,
+  setEntityCandidateEnabled,
   setEntityEnabled,
   ScheduledTask,
   SourceEntity,
@@ -195,7 +196,7 @@ function mappingForm(row: SourceEntity): EntityPayload | null {
     src_region: row.src_region || "",
     dst_region: row.dst_region || "",
     is_backup: row.is_backup,
-    enabled: true,
+    enabled: row.enabled ?? true,
     remark: row.is_backup ? "备份数据源，暂不自动补录" : ""
   };
 }
@@ -238,6 +239,7 @@ export function App() {
   const [entityStatusFilter, setEntityStatusFilter] = useState<"all" | "enabled" | "disabled">("all");
   const [entityStatusSearch, setEntityStatusSearch] = useState("");
   const [statusPendingIds, setStatusPendingIds] = useState<Set<number>>(() => new Set());
+  const [candidateStatusPendingIds, setCandidateStatusPendingIds] = useState<Set<number>>(() => new Set());
   const [discoverySearch, setDiscoverySearch] = useState("");
   const [discoveryStatusFilter, setDiscoveryStatusFilter] = useState<DiscoveryStatusFilter>("all");
   const [discoverySort, setDiscoverySort] = useState<{ key: DiscoverySortKey; direction: "asc" | "desc" }>({
@@ -572,8 +574,8 @@ export function App() {
   const filteredEntities = useMemo(() => {
     const keyword = discoverySearch.trim().toLocaleLowerCase();
     const rows = entities.filter((item) => {
-      if (discoveryStatusFilter === "enabled" && (!item.configured || !item.enabled)) return false;
-      if (discoveryStatusFilter === "disabled" && (!item.configured || item.enabled !== false)) return false;
+      if (discoveryStatusFilter === "enabled" && item.enabled !== true) return false;
+      if (discoveryStatusFilter === "disabled" && item.enabled !== false) return false;
       if (duplicateNameFilter && item.edc_name !== duplicateNameFilter) return false;
       if (!keyword) return true;
       return [item.edc_name, item.sn, item.display_name || "", item.alias || ""]
@@ -588,8 +590,8 @@ export function App() {
       })
       .map(({ item }) => item);
   }, [discoverySearch, discoverySort, discoveryStatusFilter, duplicateNameFilter, entities]);
-  const selectableEntities = filteredEntities.filter((item) => !item.configured);
-  const selectedEntities = entities.filter((item) => selectedKeys.has(entityKey(item)));
+  const selectableEntities = filteredEntities.filter((item) => !item.configured && item.enabled !== false);
+  const selectedEntities = entities.filter((item) => !item.configured && item.enabled !== false && selectedKeys.has(entityKey(item)));
   const allSelectableChecked =
     selectableEntities.length > 0 && selectableEntities.every((item) => selectedKeys.has(entityKey(item)));
 
@@ -622,7 +624,7 @@ export function App() {
   }
 
   function toggleEntity(row: SourceEntity) {
-    if (row.configured) return;
+    if (row.configured || row.enabled === false) return;
     setSelectedKeys((current) => {
       const next = new Set(current);
       const key = entityKey(row);
@@ -648,6 +650,10 @@ export function App() {
 
   async function handleSave() {
     if (!form) return;
+    if (selected && !selected.configured && selected.enabled === false) {
+      setNotice({ tone: "info", text: "该待录入条目已禁用，请先启用后再写入映射" });
+      return;
+    }
     setLoading((current) => ({ ...current, save: true }));
     try {
       const response = await saveEntity(form);
@@ -737,6 +743,48 @@ export function App() {
       setStatusPendingIds((current) => {
         const next = new Set(current);
         next.delete(entityId);
+        return next;
+      });
+    }
+  }
+
+  async function handleCandidateStatusToggle(entity: SourceEntity) {
+    const candidateId = entity.candidate_id;
+    if (candidateId === undefined || entity.configured) return;
+    const nextEnabled = !(entity.enabled ?? true);
+    const action = nextEnabled ? "启用" : "禁用";
+    const impact = nextEnabled
+      ? "恢复该条目的待录入提醒、映射选择和历史补录流程。"
+      : "停止该条目的待录入提醒、映射选择和历史补录流程；源端数据不会删除。";
+    if (!window.confirm(`确认${action}待录入条目 ${entity.edc_name}（candidate_id=${candidateId}，SN=${entity.sn || "-"}）？\n${impact}`)) return;
+    setCandidateStatusPendingIds((current) => new Set(current).add(candidateId));
+    try {
+      const response = await setEntityCandidateEnabled(candidateId, nextEnabled);
+      setEntities((current) => current.map((item) =>
+        item.candidate_id === candidateId
+          ? { ...item, enabled: response.item.enabled, candidate_status: response.item.status }
+          : item,
+      ));
+      setSelected((current) => {
+        if (!current || current.candidate_id !== candidateId) return current;
+        const updated = { ...current, enabled: response.item.enabled, candidate_status: response.item.status };
+        setForm(mappingForm(updated));
+        return updated;
+      });
+      if (!nextEnabled) {
+        setSelectedKeys((current) => {
+          const next = new Set(current);
+          next.delete(entityKey(entity));
+          return next;
+        });
+      }
+      setNotice({ tone: "ok", text: `${entity.edc_name}（${entity.sn || "无SN"}）已${action}` });
+    } catch (error) {
+      setNotice({ tone: "error", text: error instanceof Error ? error.message : "待录入条目状态更新失败" });
+    } finally {
+      setCandidateStatusPendingIds((current) => {
+        const next = new Set(current);
+        next.delete(candidateId);
         return next;
       });
     }
@@ -1035,7 +1083,7 @@ export function App() {
                         <input
                           aria-label={`选择 ${row.edc_name}`}
                           checked={selectedKeys.has(entityKey(row))}
-                          disabled={row.configured}
+                          disabled={row.configured || row.enabled === false}
                           onChange={() => toggleEntity(row)}
                           onClick={(event) => event.stopPropagation()}
                           type="checkbox"
@@ -1074,7 +1122,7 @@ export function App() {
                         </span>
                       </td>
                       <td>
-                        {row.configured && row.enabled !== undefined ? (
+                        {row.enabled !== undefined ? (
                           <span className={row.enabled ? "state ok" : "state pending"}>
                             {row.enabled ? "已启用" : "已禁用"}
                           </span>
@@ -1093,6 +1141,19 @@ export function App() {
                           >
                             {statusPendingIds.has(row.entity_id) ? <Loader2 className="spin" size={14} /> : <Power size={14} />}
                             {row.enabled ? "禁用" : "启用"}
+                          </button>
+                        ) : !row.configured && row.candidate_id !== undefined ? (
+                          <button
+                            className={row.enabled === false ? "status-action enable" : "status-action disable"}
+                            disabled={candidateStatusPendingIds.has(row.candidate_id)}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleCandidateStatusToggle(row);
+                            }}
+                            type="button"
+                          >
+                            {candidateStatusPendingIds.has(row.candidate_id) ? <Loader2 className="spin" size={14} /> : <Power size={14} />}
+                            {row.enabled === false ? "启用" : "禁用"}
                           </button>
                         ) : "-"}
                       </td>

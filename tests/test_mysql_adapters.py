@@ -205,6 +205,30 @@ def test_set_entity_enabled_updates_state_and_writes_audit(monkeypatch):
     assert any("INSERT INTO edc_entity_status_audit" in query for query in conn.cursor_obj.queries)
 
 
+def test_set_entity_candidate_enabled_updates_status_and_writes_audit(monkeypatch):
+    conn = FakeCandidateConnection()
+    monkeypatch.setattr(mysql_adapters, "connect", lambda config: conn)
+    monkeypatch.setattr(mysql_adapters, "_ensure_candidate_schema_for_config", lambda config: None)
+    monkeypatch.setattr(mysql_adapters, "_ensure_candidate_status_audit_schema", lambda schema_conn: None)
+    target = MySQLEDCTarget(
+        DBConfig(
+            host="localhost",
+            port=3306,
+            user="root",
+            password="",
+            database="nfa",
+        )
+    )
+
+    result = target.set_entity_candidate_enabled(9, False, operator="web", source_ip="127.0.0.1")
+
+    assert result["enabled"] == 0
+    assert result["status"] == "disabled"
+    assert conn.commits == 1
+    assert any("UPDATE edc_entity_candidates SET enabled" in query for query in conn.cursor_obj.queries)
+    assert any("INSERT INTO edc_entity_candidate_status_audit" in query for query in conn.cursor_obj.queries)
+
+
 class FakeSelectConnection:
     def __init__(self, rows):
         self.rows = rows
@@ -344,6 +368,58 @@ class FakeStatusCursor:
 class FakeStatusConnection:
     def __init__(self):
         self.cursor_obj = FakeStatusCursor()
+        self.commits = 0
+
+    def cursor(self, dictionary=False):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class FakeCandidateCursor:
+    def __init__(self):
+        self.queries = []
+        self.rowcount = 0
+        self.candidate = {
+            "id": 9,
+            "edc_name": "BJ-ali-01",
+            "sn": "NEW-SN",
+            "enabled": 1,
+            "status": "pending",
+            "entity_id": None,
+            "updated_at": None,
+        }
+        self._next = None
+
+    def execute(self, query, params=None):
+        self.queries.append(query)
+        normalized = query.lstrip().upper()
+        self.rowcount = 0
+        if "FOR UPDATE" in normalized:
+            self._next = dict(self.candidate)
+        elif normalized.startswith("UPDATE EDC_ENTITY_CANDIDATES"):
+            self.candidate["enabled"] = params[0]
+            self.candidate["status"] = params[1]
+            self.rowcount = 1
+        elif normalized.startswith("INSERT INTO EDC_ENTITY_CANDIDATE_STATUS_AUDIT"):
+            self.rowcount = 1
+        elif normalized.startswith("SELECT ID"):
+            self._next = dict(self.candidate)
+
+    def fetchone(self):
+        return self._next
+
+
+class FakeCandidateConnection:
+    def __init__(self):
+        self.cursor_obj = FakeCandidateCursor()
         self.commits = 0
 
     def cursor(self, dictionary=False):
